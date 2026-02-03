@@ -21,7 +21,7 @@ class PIPERLeader(Teleoperator):
         self.config = config
         self.bus = PiperMotorsBus(
             PiperMotorsBusConfig(
-                can_name="can_master",
+                can_name="can_leader_l",
                 motors={
                     "joint_1": (1, "agilex_piper"),
                     "joint_2": (2, "agilex_piper"),

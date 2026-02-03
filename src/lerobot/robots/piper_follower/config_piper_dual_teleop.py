@@ -36,12 +36,12 @@ class PIPERDualTeleopConfig(RobotConfig):
     """
 
     # Leader arm CAN ports (for reading teleop commands)
-    left_leader_port: str = "can_left_leader"
-    right_leader_port: str = "can_right_leader"
+    left_leader_port: str = "can_leader_l"
+    right_leader_port: str = "can_leader_r"
 
     # Follower arm CAN ports (for executing actions)
-    left_follower_port: str = "can_left_follower"
-    right_follower_port: str = "can_right_follower"
+    left_follower_port: str = "can_follow_l"
+    right_follower_port: str = "can_follow_r"
 
     # Whether to use software teleop (read from leaders, write to followers)
     # If False, only followers are used (for inference/replay)

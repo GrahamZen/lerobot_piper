@@ -28,7 +28,7 @@ class PIPERFollower(Robot):
         self.config = config
         self.bus = PiperMotorsBus(
             PiperMotorsBusConfig(
-                can_name="can_follower",
+                can_name="can_follow_l",
                 motors={
                     "joint_1": (1, "agilex_piper"),
                     "joint_2": (2, "agilex_piper"),
