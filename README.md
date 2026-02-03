@@ -153,6 +153,36 @@ _Note: Adjust `episode_time_s` to match your task length since you cannot use ke
 Using `piper_dual_teleop` plugin, software reads Leader positions and writes to Followers:
 
 ```bash
+lerobot-record \
+  --robot.type=piper_follower \
+  --robot.cameras='{
+    "wrist": {
+      "type": "opencv",
+      "index_or_path": "/dev/video6",
+      "width": 640,
+      "height": 480,
+      "fps": 30,
+      "rotation": 0,
+    },
+    "ground": {
+      "type": "opencv",
+      "index_or_path": "/dev/video0",
+      "width": 640,
+      "height": 480,
+      "fps": 30,
+      "rotation": 0,
+    }
+  }' \
+  --teleop.type=piper_leader \
+  --dataset.repo_id=local/lerobot_new_dataset \
+  --dataset.num_episodes=50 \
+  --dataset.episode_time_s=30 \
+  --dataset.single_task="Dual arm manipulation task." \
+  --display_data=true \
+  --dataset.push_to_hub=false
+```
+
+```bash
 uv run lerobot-record \
   --robot.type=piper_dual_teleop \
   --robot.left_leader_port=can_left_leader \

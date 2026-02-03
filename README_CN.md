@@ -47,10 +47,10 @@ bash can_activate.sh can_follower 1000000 "1-8.3:1.0"
 
 ```bash
 # 激活 4 个 CAN 端口
-bash can_activate.sh can_left_leader 1000000 "<usb_port1>"
-bash can_activate.sh can_left_follower 1000000 "<usb_port2>"
-bash can_activate.sh can_right_leader 1000000 "<usb_port3>"
-bash can_activate.sh can_right_follower 1000000 "<usb_port4>"
+bash can_activate.sh can_leader 1000000 "<usb_port1>"
+bash can_activate.sh can_follow_l 1000000 "<usb_port2>"
+bash can_activate.sh can_leader_r 1000000 "<usb_port3>"
+bash can_activate.sh can_follow_r 1000000 "<usb_port4>"
 ```
 
 **软件遥操作流程**：
@@ -153,10 +153,10 @@ _Note: Adjust `episode_time_s` to match your task length since you cannot use ke
 ```bash
 uv run lerobot-record \
   --robot.type=piper_dual_teleop \
-  --robot.left_leader_port=can_left_leader \
-  --robot.left_follower_port=can_left_follower \
-  --robot.right_leader_port=can_right_leader \
-  --robot.right_follower_port=can_right_follower \
+  --robot.left_leader_port=can_leader_l \
+  --robot.left_follower_port=can_follow_l \
+  --robot.right_leader_port=can_leader_r \
+  --robot.right_follower_port=can_follow_r \
   --robot.use_teleop=true \
   --robot.cameras='{"left":{"type":"opencv","index_or_path":"/dev/video4","width":640,"height":480,"fps":30},"right":{"type":"opencv","index_or_path":"/dev/video12","width":640,"height":480,"fps":30},"middle":{"type":"opencv","index_or_path":"/dev/video6","width":640,"height":480,"fps":30}}' \
   --dataset.repo_id=local/dual_teleop_dataset \
@@ -224,8 +224,8 @@ lerobot-replay \
 ```bash
 uv run lerobot-replay \
     --robot.type=piper_dual_teleop \
-    --robot.left_follower_port=can_left_follower \
-    --robot.right_follower_port=can_right_follower \
+    --robot.left_follower_port=can_follow_l \
+    --robot.right_follower_port=can_follow_r \
     --robot.use_teleop=false \
     --robot.cameras='{"left":{"type":"opencv","index_or_path":"/dev/video4","width":640,"height":480,"fps":30},"right":{"type":"opencv","index_or_path":"/dev/video12","width":640,"height":480,"fps":30},"middle":{"type":"opencv","index_or_path":"/dev/video6","width":640,"height":480,"fps":30}}' \
     --dataset.repo_id=local/dual_teleop_dataset \
@@ -298,8 +298,8 @@ For inference, set `use_teleop=false`, only 2 Follower CAN ports needed:
 ```bash
 uv run lerobot-record \
   --robot.type=piper_dual_teleop \
-  --robot.left_follower_port=can_left_follower \
-  --robot.right_follower_port=can_right_follower \
+  --robot.left_follower_port=can_follow_l \
+  --robot.right_follower_port=can_follow_r \
   --robot.use_teleop=false \
   --robot.cameras='{"left":{"type":"opencv","index_or_path":"/dev/video4","width":640,"height":480,"fps":30},"right":{"type":"opencv","index_or_path":"/dev/video12","width":640,"height":480,"fps":30},"middle":{"type":"opencv","index_or_path":"/dev/video6","width":640,"height":480,"fps":30}}' \
   --dataset.repo_id=local/eval_test \
