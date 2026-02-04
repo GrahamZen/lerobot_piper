@@ -220,17 +220,17 @@ uv run lerobot-dataset-viz --repo-id local/lerobot_new_dataset --root ~/.cache/h
 
 ```bash
 # Visualize specific dataset episode.
-uv run python piper_viz_tools/visualize_episode.py --repo_id local/lerobot_pick_and_place --episode 0
+uv run python tools/viz/visualize_episode.py --repo_id local/lerobot_pick_and_place --episode 0
 ```
 
 ```bash
 # Visualize entire LeRobot dataset (sped up)
-uv run python piper_viz_tools/visualize_dataset.py --repo_id local/lerobot_pick_and_place
+uv run python tools/viz/visualize_dataset.py --repo_id local/lerobot_pick_and_place
 ```
 
 ```bash
 # Visualize ACT model chunk.
-uv run python piper_viz_tools/visualize_action_chunk.py \
+uv run python tools/viz/visualize_action_chunk.py \
     --pretrained_path /path/to/model \
     --repo_id lerobot_pick_and_place \
     --episode_index 0 \
