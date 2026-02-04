@@ -6,6 +6,7 @@ python visualize_action_chunk.py \
     --episode_index 0 \
     --frame_index 90
 """
+
 import argparse
 import math
 import time
@@ -15,7 +16,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import rerun as rr
 import torch
-from PIL import Image
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.policies.act.modeling_act import ACTPolicy
@@ -80,19 +80,19 @@ class PiperFK:
         # joints: 6 angles
         # gripper_val: distance in meters
         transforms = {}
-        T = np.eye(4)
-        transforms["base_link"] = T.copy()
+        transform = np.eye(4)
+        transforms["base_link"] = transform.copy()
 
         # FK for 6 joints
         for i in range(6):
             theta = joints[i] + self._theta_offset[i]
-            Ti = self._link_transform(self._alpha[i], self._a[i], theta, self._d[i])
-            T = T @ Ti
-            transforms[f"link{i + 1}"] = T.copy()
+            t_i = self._link_transform(self._alpha[i], self._a[i], theta, self._d[i])
+            transform = transform @ t_i
+            transforms[f"link{i + 1}"] = transform.copy()
 
         # Gripper Base (Fixed to link6)
-        T_gripper_base = T.copy()  # joint6_to_gripper_base origin is 0 0 0
-        transforms["gripper_base"] = T_gripper_base
+        t_gripper_base = transform.copy()  # joint6_to_gripper_base origin is 0 0 0
+        transforms["gripper_base"] = t_gripper_base
 
         # Gripper Fingers
         # Joint 7: origin 0 0 0.1358, rpy 1.5708 0 0. Prismatic z
@@ -102,13 +102,13 @@ class PiperFK:
             cy, sy = math.cos(rpy[1]), math.sin(rpy[1])
             cz, sz = math.cos(rpy[2]), math.sin(rpy[2])
 
-            Rx = np.array([[1, 0, 0, 0], [0, cx, -sx, 0], [0, sx, cx, 0], [0, 0, 0, 1]])
-            Ry = np.array([[cy, 0, sy, 0], [0, 1, 0, 0], [-sy, 0, cy, 0], [0, 0, 0, 1]])
-            Rz = np.array([[cz, -sz, 0, 0], [sz, cz, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
+            r_x = np.array([[1, 0, 0, 0], [0, cx, -sx, 0], [0, sx, cx, 0], [0, 0, 0, 1]])
+            r_y = np.array([[cy, 0, sy, 0], [0, 1, 0, 0], [-sy, 0, cy, 0], [0, 0, 0, 1]])
+            r_z = np.array([[cz, -sz, 0, 0], [sz, cz, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
 
-            Tr = np.eye(4)
-            Tr[:3, 3] = xyz
-            return Tr @ Rz @ Ry @ Rx
+            t_r = np.eye(4)
+            t_r[:3, 3] = xyz
+            return t_r @ r_z @ r_y @ r_x
 
         # Link 7 (Left Finger)
         j7_origin = get_fixed([0, 0, 0.1358], [1.5708, 0, 0])
@@ -117,17 +117,17 @@ class PiperFK:
         half_dist = gripper_val / 2.0
         j7_pos = max(0, min(half_dist, 0.035))
 
-        T_prismatic = np.eye(4)
-        T_prismatic[2, 3] = j7_pos
-        transforms["link7"] = T_gripper_base @ j7_origin @ T_prismatic
+        t_prismatic = np.eye(4)
+        t_prismatic[2, 3] = j7_pos
+        transforms["link7"] = t_gripper_base @ j7_origin @ t_prismatic
 
         # Link 8 (Right Finger)
         j8_origin = get_fixed([0, 0, 0.1358], [1.5708, 0, -3.1416])
         j8_pos = j7_pos  # Symmetric movement in rotated frame
 
-        T_prismatic8 = np.eye(4)
-        T_prismatic8[2, 3] = j8_pos
-        transforms["link8"] = T_gripper_base @ j8_origin @ T_prismatic8
+        t_prismatic8 = np.eye(4)
+        t_prismatic8[2, 3] = j8_pos
+        transforms["link8"] = t_gripper_base @ j8_origin @ t_prismatic8
 
         return transforms
 
@@ -148,42 +148,53 @@ def visualize_trajectory(fk, action_data, prefix, offset_y=0.0):
         # Left Arm
         left_joints = action_data[0:6]
         left_grip = action_data[6]
-        left_T = fk.get_transforms(left_joints, left_grip)
+        left_transforms = fk.get_transforms(left_joints, left_grip)
 
-        T_left_base = np.eye(4)
-        T_left_base[1, 3] = 0.3 + offset_y
+        t_left_base = np.eye(4)
+        t_left_base[1, 3] = 0.3 + offset_y
 
-        for link_name, T_local in left_T.items():
-            T_global = T_left_base @ T_local
+        for link_name, t_local in left_transforms.items():
+            t_global = t_left_base @ t_local
             rr.log(
                 f"{prefix}/left_arm/{link_name}",
-                rr.Transform3D(translation=T_global[:3, 3], mat3x3=T_global[:3, :3]),
+                rr.Transform3D(translation=t_global[:3, 3], mat3x3=t_global[:3, :3]),
             )
 
         # Right Arm
         right_joints = action_data[7:13]
         right_grip = action_data[13]
-        right_T = fk.get_transforms(right_joints, right_grip)
+        right_transforms = fk.get_transforms(right_joints, right_grip)
 
-        T_right_base = np.eye(4)
-        T_right_base[1, 3] = -0.3 + offset_y
+        t_right_base = np.eye(4)
+        t_right_base[1, 3] = -0.3 + offset_y
 
-        for link_name, T_local in right_T.items():
-            T_global = T_right_base @ T_local
+        for link_name, t_local in right_transforms.items():
+            t_global = t_right_base @ t_local
             rr.log(
                 f"{prefix}/right_arm/{link_name}",
-                rr.Transform3D(translation=T_global[:3, 3], mat3x3=T_global[:3, :3]),
+                rr.Transform3D(translation=t_global[:3, 3], mat3x3=t_global[:3, :3]),
             )
 
 
 def main():
     parser = argparse.ArgumentParser(description="Visualize action chunks predicted by a pretrained model.")
-    parser.add_argument("--pretrained_path", type=Path, default=DEFAULT_PRETRAINED_MODEL_PATH, help="Path to pretrained model")
-    parser.add_argument("--dataset_root", type=Path, default=DEFAULT_DATASET_ROOT, help="Root directory of the dataset")
+    parser.add_argument(
+        "--pretrained_path", type=Path, default=DEFAULT_PRETRAINED_MODEL_PATH, help="Path to pretrained model"
+    )
+    parser.add_argument(
+        "--dataset_root", type=Path, default=DEFAULT_DATASET_ROOT, help="Root directory of the dataset"
+    )
     parser.add_argument("--repo_id", type=str, default=DEFAULT_DATASET_ID, help="Dataset repository ID")
-    parser.add_argument("--episode_index", type=int, default=None, help="Index of the episode to inspect (default: random)")
-    parser.add_argument("--frame_index", type=int, default=90, help="Frame index relative to the start of the episode (default: 90)")
-    
+    parser.add_argument(
+        "--episode_index", type=int, default=None, help="Index of the episode to inspect (default: random)"
+    )
+    parser.add_argument(
+        "--frame_index",
+        type=int,
+        default=90,
+        help="Frame index relative to the start of the episode (default: 90)",
+    )
+
     args = parser.parse_args()
 
     print(f"Loading model from {args.pretrained_path}...")
@@ -211,13 +222,13 @@ def main():
     else:
         episode_idx = args.episode_index
         if episode_idx < 0 or episode_idx >= num_episodes:
-            print(f"Error: Episode index {episode_idx} out of range (0-{num_episodes-1})")
+            print(f"Error: Episode index {episode_idx} out of range (0-{num_episodes - 1})")
             return
         print(f"Selected episode index: {episode_idx}")
 
     # Get frame selection
     episode_data = dataset.meta.episodes[episode_idx]
-    
+
     if "index" in episode_data:
         start_index = episode_data["index"]
     elif "dataset_from_index" in episode_data:
@@ -233,7 +244,9 @@ def main():
     # Calculate absolute frame index
     relative_frame_idx = min(args.frame_index, length - 1)
     frame_idx = start_index + relative_frame_idx
-    print(f"Selected frame: {frame_idx} (Episode {episode_idx}, relative frame {relative_frame_idx}/{length})")
+    print(
+        f"Selected frame: {frame_idx} (Episode {episode_idx}, relative frame {relative_frame_idx}/{length})"
+    )
 
     item = dataset[frame_idx]
 
@@ -278,14 +291,14 @@ def main():
     # Output Directory
     output_dir = Path("outputs/visualize_action_chunk")
     output_dir.mkdir(parents=True, exist_ok=True)
-    
+
     output_plot_path = output_dir / f"episode_{episode_idx}_frame_{frame_idx}_plot.png"
 
     # Plotting
     print("Plotting...")
 
     # Identify image keys
-    image_keys = [k for k in item.keys() if "image" in k]
+    image_keys = [k for k in item if "image" in k]
     num_images = len(image_keys)
 
     if num_images > 0:
@@ -345,12 +358,12 @@ def main():
     fk = PiperFK()
     fk.log_initial_meshes("simulation/prediction/left_arm")
     fk.log_initial_meshes("simulation/prediction/right_arm")
-    
+
     # Log images once since this is a single frame prediction (though images update in dataset, we are predicting chunk FROM this frame's images)
     # The action chunk is a sequence, but the image context is just the current frame.
     # We can log the images at step 0 of the visualization.
     if num_images > 0:
-         for idx, key in enumerate(sorted(image_keys)):
+        for _idx, key in enumerate(sorted(image_keys)):
             img_tensor = item[key]
             # Convert (C, H, W) -> (H, W, C) numpy
             if isinstance(img_tensor, torch.Tensor):
@@ -359,7 +372,7 @@ def main():
                     img_np = np.clip(img_np, 0, 1)
                 elif img_np.dtype == np.uint8:
                     pass
-                
+
                 clean_key = key.replace("observation.images.", "")
                 rr.log(f"cameras/{clean_key}", rr.Image(img_np))
 
@@ -377,7 +390,7 @@ def main():
 
         # Sleep to simulate real-time playback
         elapsed = time.time() - start_time
-        sleep_time = max(0, (1.0/30.0) - elapsed)
+        sleep_time = max(0, (1.0 / 30.0) - elapsed)
         time.sleep(sleep_time)
 
     print("Playback complete. Rerun should be open.")

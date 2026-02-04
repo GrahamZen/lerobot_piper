@@ -1,6 +1,7 @@
 """
 Usage: python visualize_dataset.py --repo_id=local/lerobot_pick_and_place
 """
+
 import argparse
 import math
 from pathlib import Path
@@ -10,6 +11,7 @@ import rerun as rr
 from PIL import Image
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
 
 class PiperFK:
     def __init__(self):
@@ -62,19 +64,19 @@ class PiperFK:
         # joints: 6 angles
         # gripper_val: distance in meters
         transforms = {}
-        T = np.eye(4)
-        transforms["base_link"] = T.copy()
+        transform = np.eye(4)
+        transforms["base_link"] = transform.copy()
 
         # FK for 6 joints
         for i in range(6):
             theta = joints[i] + self._theta_offset[i]
-            Ti = self._link_transform(self._alpha[i], self._a[i], theta, self._d[i])
-            T = T @ Ti
-            transforms[f"link{i + 1}"] = T.copy()
+            t_i = self._link_transform(self._alpha[i], self._a[i], theta, self._d[i])
+            transform = transform @ t_i
+            transforms[f"link{i + 1}"] = transform.copy()
 
         # Gripper Base (Fixed to link6)
-        T_gripper_base = T.copy()  # joint6_to_gripper_base origin is 0 0 0
-        transforms["gripper_base"] = T_gripper_base
+        t_gripper_base = transform.copy()  # joint6_to_gripper_base origin is 0 0 0
+        transforms["gripper_base"] = t_gripper_base
 
         # Gripper Fingers
         # Joint 7: origin 0 0 0.1358, rpy 1.5708 0 0. Prismatic z
@@ -84,13 +86,13 @@ class PiperFK:
             cy, sy = math.cos(rpy[1]), math.sin(rpy[1])
             cz, sz = math.cos(rpy[2]), math.sin(rpy[2])
 
-            Rx = np.array([[1, 0, 0, 0], [0, cx, -sx, 0], [0, sx, cx, 0], [0, 0, 0, 1]])
-            Ry = np.array([[cy, 0, sy, 0], [0, 1, 0, 0], [-sy, 0, cy, 0], [0, 0, 0, 1]])
-            Rz = np.array([[cz, -sz, 0, 0], [sz, cz, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
+            r_x = np.array([[1, 0, 0, 0], [0, cx, -sx, 0], [0, sx, cx, 0], [0, 0, 0, 1]])
+            r_y = np.array([[cy, 0, sy, 0], [0, 1, 0, 0], [-sy, 0, cy, 0], [0, 0, 0, 1]])
+            r_z = np.array([[cz, -sz, 0, 0], [sz, cz, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
 
-            Tr = np.eye(4)
-            Tr[:3, 3] = xyz
-            return Tr @ Rz @ Ry @ Rx
+            t_r = np.eye(4)
+            t_r[:3, 3] = xyz
+            return t_r @ r_z @ r_y @ r_x
 
         # Link 7 (Left Finger)
         j7_origin = get_fixed([0, 0, 0.1358], [1.5708, 0, 0])
@@ -99,17 +101,17 @@ class PiperFK:
         half_dist = gripper_val / 2.0
         j7_pos = max(0, min(half_dist, 0.035))
 
-        T_prismatic = np.eye(4)
-        T_prismatic[2, 3] = j7_pos
-        transforms["link7"] = T_gripper_base @ j7_origin @ T_prismatic
+        t_prismatic = np.eye(4)
+        t_prismatic[2, 3] = j7_pos
+        transforms["link7"] = t_gripper_base @ j7_origin @ t_prismatic
 
         # Link 8 (Right Finger)
         j8_origin = get_fixed([0, 0, 0.1358], [1.5708, 0, -3.1416])
         j8_pos = j7_pos  # Symmetric movement in rotated frame
 
-        T_prismatic8 = np.eye(4)
-        T_prismatic8[2, 3] = j8_pos
-        transforms["link8"] = T_gripper_base @ j8_origin @ T_prismatic8
+        t_prismatic8 = np.eye(4)
+        t_prismatic8[2, 3] = j8_pos
+        transforms["link8"] = t_gripper_base @ j8_origin @ t_prismatic8
 
         return transforms
 
@@ -120,6 +122,7 @@ class PiperFK:
             if mesh_path.exists():
                 color = self.link_colors.get(link, [200, 200, 200])
                 rr.log(f"{prefix}/{link}", rr.Asset3D(path=mesh_path, albedo_factor=color), static=True)
+
 
 def visualize_dataset(repo_id, root=None, stride=7):
     print(f"Loading dataset: {repo_id}")
@@ -135,8 +138,8 @@ def visualize_dataset(repo_id, root=None, stride=7):
             from lerobot.datasets.utils import load_episodes
 
             dataset.meta.episodes = load_episodes(dataset.root)
-        except:
-            pass
+        except Exception as e:
+            print(f"Warning: Could not load episodes metadata: {e}")
 
     total_episodes = len(dataset.meta.episodes)
     print(f"Total episodes available: {total_episodes}")
@@ -172,8 +175,6 @@ def visualize_dataset(repo_id, root=None, stride=7):
         # Log it at the current global_step so it appears at the right time.
 
         for i in range(from_idx, to_idx, stride):
-            relative_step = i - from_idx
-
             # Set timelines - ONLY global_step to ensure continuous playback
             rr.set_time_sequence("global_step", global_step)
             global_step += 1
@@ -203,35 +204,35 @@ def visualize_dataset(repo_id, root=None, stride=7):
                     # Left Arm
                     left_joints = act[0:6]
                     left_grip = act[6]
-                    left_T = fk.get_transforms(left_joints, left_grip)
+                    left_transforms = fk.get_transforms(left_joints, left_grip)
 
-                    T_left_base = np.eye(4)
-                    T_left_base[1, 3] = 0.32
+                    t_left_base = np.eye(4)
+                    t_left_base[1, 3] = 0.32
 
-                    for link_name, T_local in left_T.items():
-                        T_global = T_left_base @ T_local
+                    for link_name, t_local in left_transforms.items():
+                        t_global = t_left_base @ t_local
                         rr.log(
                             f"simulation/left_arm/{link_name}",
-                            rr.Transform3D(translation=T_global[:3, 3], mat3x3=T_global[:3, :3]),
+                            rr.Transform3D(translation=t_global[:3, 3], mat3x3=t_global[:3, :3]),
                         )
 
                     # Right Arm
                     right_joints = act[7:13]
                     right_grip = act[13]
-                    right_T = fk.get_transforms(right_joints, right_grip)
+                    right_transforms = fk.get_transforms(right_joints, right_grip)
 
-                    T_right_base = np.eye(4)
-                    T_right_base[1, 3] = -0.32
+                    t_right_base = np.eye(4)
+                    t_right_base[1, 3] = -0.32
 
-                    for link_name, T_local in right_T.items():
-                        T_global = T_right_base @ T_local
+                    for link_name, t_local in right_transforms.items():
+                        t_global = t_right_base @ t_local
                         rr.log(
                             f"simulation/right_arm/{link_name}",
-                            rr.Transform3D(translation=T_global[:3, 3], mat3x3=T_global[:3, :3]),
+                            rr.Transform3D(translation=t_global[:3, 3], mat3x3=t_global[:3, :3]),
                         )
 
             # 2. Images
-            image_keys = [k for k in item.keys() if "image" in k]
+            image_keys = [k for k in item if "image" in k]
             for img_key in image_keys:
                 img_data = item[img_key]
                 clean_key = img_key.replace("observation.images.", "")
@@ -246,9 +247,8 @@ def visualize_dataset(repo_id, root=None, stride=7):
                     arr = img_data
                     if hasattr(arr, "numpy"):
                         arr = arr.numpy()
-                    if arr.ndim == 3:
-                        if arr.shape[0] <= 4:
-                            arr = np.transpose(arr, (1, 2, 0))
+                    if arr.ndim == 3 and arr.shape[0] <= 4:
+                        arr = np.transpose(arr, (1, 2, 0))
 
                     rr.log(f"cameras/{clean_key}", rr.Image(arr))
 

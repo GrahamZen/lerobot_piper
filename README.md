@@ -305,7 +305,7 @@ uv run lerobot-train \
   --policy.n_action_steps=50 \
   --steps=100000 \
   --save_freq=10000 \
-  --dataset.image_transforms.enable=true 
+  --dataset.image_transforms.enable=true
 ```
 
 ### Upload model or checkpoints to Hugging Face
