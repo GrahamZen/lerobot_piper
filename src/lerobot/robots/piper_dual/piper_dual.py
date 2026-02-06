@@ -213,8 +213,8 @@ class PIPERDual(Robot):
         print("piper disable after 5 seconds")
         time.sleep(5)
 
-        self.left_bus.connect(enable=False)
-        self.right_bus.connect(enable=False)
+        # self.left_bus.connect(enable=False)
+        # self.right_bus.connect(enable=False)
 
         if len(self.cameras) > 0:
             for cam in self.cameras.values():
