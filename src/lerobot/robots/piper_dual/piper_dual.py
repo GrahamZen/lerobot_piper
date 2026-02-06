@@ -205,13 +205,13 @@ class PIPERDual(Robot):
 
     def disconnect(self) -> None:
         """move to home position, disenable piper and cameras"""
-        print("Disconnecting left arm...")
+        # print("Disconnecting left arm...")
         # self.left_bus.safe_disconnect()
-        print("Disconnecting right arm...")
+        # print("Disconnecting right arm...")
         # self.right_bus.safe_disconnect()
 
-        print("piper disable after 5 seconds")
-        time.sleep(5)
+        # print("piper disable after 5 seconds")
+        # time.sleep(5)
 
         # self.left_bus.connect(enable=False)
         # self.right_bus.connect(enable=False)

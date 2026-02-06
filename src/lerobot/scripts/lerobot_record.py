@@ -222,6 +222,10 @@ def init_tk_window(events, msg_queue):
                 except Exception as e:
                     print(f"Error getting from queue: {e}")
 
+                if images:
+                    # Dynamically create labels if new cameras appear
+                    current_keys = sorted(list(images.keys()))
+
                     # If we haven't set up the grid or keys changed (unlikely but safe)
                     for idx, key in enumerate(current_keys):
                         if key not in image_labels:
