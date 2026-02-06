@@ -181,6 +181,7 @@ def init_tk_window(events, msg_queue):
 
     def run_tk():
         try:
+            print("Initializing Tkinter Window...")
             root = tk.Tk()
             root.title("LeRobot Control")
             # Make window larger to fit cameras
@@ -217,18 +218,20 @@ def init_tk_window(events, msg_queue):
                         images = msg_queue.get_nowait()
                 except queue.Empty:
                     pass
+                except Exception as e:
+                    print(f"Error getting from queue: {e}")
 
                 if images:
-                    # 'images' is a dict of key -> numpy array (H, W, C) or torch tensor
-                    # Need to verify format. Assuming standard robot output (H, W, C) uint8 numpy 
-                    # or similar that PIL can handle.
+                    # DEBUG: Print received keys once or periodically
+                    # print(f"UI Received images: {list(images.keys())}") 
                     
                     # Dynamically create labels if new cameras appear
-                    current_keys = list(images.keys())
+                    current_keys = sorted(list(images.keys()))
                     
                     # If we haven't set up the grid or keys changed (unlikely but safe)
                     for idx, key in enumerate(current_keys):
                         if key not in image_labels:
+                            print(f"Creating label for camera: {key}")
                             lbl = tk.Label(video_frame_container, text=key)
                             lbl.grid(row=idx // 2 * 2, column=idx % 2, sticky="nsew") 
                             # Image label below text
@@ -243,35 +246,37 @@ def init_tk_window(events, msg_queue):
                     # Update images
                     for key, img_data in images.items():
                         if key in image_labels:
-                            # Convert to PIL
-                            # Handle potential torch tensor
-                            if hasattr(img_data, "cpu"):
-                                img_data = img_data.cpu().numpy()
-                            # Handle potential float [0,1]
-                            if img_data.dtype.kind == 'f':
-                                img_data = (img_data * 255).astype("uint8")
-                            
-                            # Handle C, H, W -> H, W, C if needed
-                            # Heuristic: if shape[0] is 3 and shape[2] is not 3, assume CHW
-                            if img_data.ndim == 3 and img_data.shape[0] == 3 and img_data.shape[2] != 3:
-                                img_data = img_data.transpose(1, 2, 0)
-
-                            if img_data.ndim == 3:
-                                # Resize for display if too large? 
-                                # For now let Tkinter maximize, but maybe resize to fixed width for speed
-                                # img_data = cv2.resize(...) if we had cv2
-                                pim = Image.fromarray(img_data)
-                                # Optional: resize to fit cell?
-                                # aspect ratio
-                                w, h = pim.size
-                                target_w = 320 # Arbitrary small size for grid
-                                scale = target_w / w
-                                target_h = int(h * scale)
-                                pim = pim.resize((target_w, target_h))
+                            try:
+                                # Convert to PIL
+                                # Handle potential torch tensor
+                                if hasattr(img_data, "cpu"):
+                                    img_data = img_data.cpu().numpy()
+                                    
+                                # Handle potential float [0,1]
+                                if img_data.dtype.kind == 'f':
+                                    img_data = (img_data * 255).astype("uint8")
                                 
-                                photo = ImageTk.PhotoImage(pim)
-                                image_labels[key].config(image=photo)
-                                image_labels[key].image = photo # keep ref
+                                # Handle C, H, W -> H, W, C if needed
+                                # Heuristic: if shape[0] is 3 and shape[2] is not 3, assume CHW
+                                if img_data.ndim == 3 and img_data.shape[0] == 3 and img_data.shape[2] != 3:
+                                    img_data = img_data.transpose(1, 2, 0)
+                                    
+                                if img_data.ndim == 3:
+                                    # Resize for display if too large
+                                    pim = Image.fromarray(img_data)
+                                    # Optional: resize to fit cell?
+                                    # aspect ratio
+                                    w, h = pim.size
+                                    target_w = 320 # Arbitrary small size for grid
+                                    scale = target_w / w
+                                    target_h = int(h * scale)
+                                    pim = pim.resize((target_w, target_h))
+                                    
+                                    photo = ImageTk.PhotoImage(pim)
+                                    image_labels[key].config(image=photo)
+                                    image_labels[key].image = photo # keep ref
+                            except Exception as e:
+                                print(f"Error updating image for {key}: {e}")
 
                 root.after(30, update_images) # ~30fps poll
 
@@ -325,7 +330,7 @@ class DatasetRecordConfig:
     video_encoding_batch_size: int = 1
     # Video codec for encoding videos. Options: 'h264', 'hevc', 'libsvtav1'.
     # Use 'h264' for faster encoding on systems where AV1 encoding is CPU-heavy.
-    vcodec: str = "libsvtav1"
+    vcodec: str = "h264"
     # Rename map for the observation to override the image and state keys
     rename_map: dict[str, str] = field(default_factory=dict)
 
@@ -555,6 +560,8 @@ def record_loop(
             # obs_processed typically has keys like 'observation.images.laptop' or just 'laptop' depending on processor
             # We look for 'image' in key
             ui_images = {k: v for k, v in obs_processed.items() if "image" in k}
+            # DEBUG: Print sent keys occasionally
+            # if ui_images: print(f"Sending keys: {list(ui_images.keys())}")
             if ui_images:
                 try:
                     msg_queue.put_nowait(ui_images)
