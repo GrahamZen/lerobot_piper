@@ -67,8 +67,11 @@ import threading
 import time
 import tkinter as tk
 import queue
+from collections import deque
 from dataclasses import asdict, dataclass, field
 from PIL import Image, ImageTk
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
 from pathlib import Path
 from pprint import pformat
 from typing import Any
@@ -184,103 +187,137 @@ def init_tk_window(events, msg_queue):
             print("Initializing Tkinter Window...")
             root = tk.Tk()
             root.title("LeRobot Control")
-            # Make window larger to fit cameras
-            root.geometry("800x900")
-            print("Tkinter Window Initialized")
+            root.geometry("900x800")
 
-            # frames for layout
+            # Main container for 2x2 grid
             video_frame_container = tk.Frame(root)
             video_frame_container.pack(expand=True, fill="both", padx=10, pady=10)
+            video_frame_container.grid_columnconfigure(0, weight=1)
+            video_frame_container.grid_columnconfigure(1, weight=1)
+            video_frame_container.grid_rowconfigure(0, weight=1)
+            video_frame_container.grid_rowconfigure(1, weight=1)
+
+            # Pre-create 4 cells: 3 for cameras, 1 for joint plot
+            # Cell (0,0): left camera
+            # Cell (0,1): right camera
+            # Cell (1,0): middle camera
+            # Cell (1,1): joint plot
             
+            camera_cells = {}
+            cell_positions = [(0, 0), (0, 1), (1, 0)]
+            camera_names = ["left", "right", "middle"]
+            for name, (r, c) in zip(camera_names, cell_positions):
+                cell_frame = tk.Frame(video_frame_container, bd=1, relief="solid")
+                cell_frame.grid(row=r, column=c, sticky="nsew", padx=2, pady=2)
+                lbl_title = tk.Label(cell_frame, text=name, font=("Arial", 10, "bold"))
+                lbl_title.pack(side="top")
+                lbl_img = tk.Label(cell_frame)
+                lbl_img.pack(expand=True, fill="both")
+                camera_cells[name] = lbl_img
+
+            # Joint plot cell (1, 1)
+            plot_frame = tk.Frame(video_frame_container, bd=1, relief="solid")
+            plot_frame.grid(row=1, column=1, sticky="nsew", padx=2, pady=2)
+            lbl_plot_title = tk.Label(plot_frame, text="Joint Values", font=("Arial", 10, "bold"))
+            lbl_plot_title.pack(side="top")
+
+            fig = Figure(figsize=(4, 3), dpi=80)
+            ax = fig.add_subplot(111)
+            ax.set_ylim(-3.2, 3.2)
+            ax.set_xlim(0, 100)
+            ax.set_ylabel("Radians")
+            ax.set_xlabel("Frame")
+            fig.tight_layout()
+            canvas = FigureCanvasTkAgg(fig, master=plot_frame)
+            canvas.get_tk_widget().pack(expand=True, fill="both")
+            
+            # Store line objects for each joint
+            joint_lines = {}
+            joint_history = {}  # {joint_name: deque of values}
+            history_len = 100
+
+            # Control buttons
             control_frame = tk.Frame(root)
-            control_frame.pack(side="bottom", fill="x", padx=10, pady=10)
+            control_frame.pack(side="bottom", fill="x", padx=10, pady=5)
 
-            # Labels for images
-            image_labels = {}
-
-            # Buttons
-            btn_rerecord = tk.Button(control_frame, text="Rerecord (Left/BkSp)", command=on_click_rerecord, bg="#ffcccc", height=4)
+            btn_rerecord = tk.Button(control_frame, text="Rerecord (Left/BkSp)", command=on_click_rerecord, bg="#ffcccc", height=3)
             btn_rerecord.pack(side="left", expand=True, fill="x", padx=5)
 
-            btn_stop = tk.Button(control_frame, text="Stop (Esc)", command=on_click_stop, bg="#ff9999", height=4)
+            btn_stop = tk.Button(control_frame, text="Stop (Esc)", command=on_click_stop, bg="#ff9999", height=3)
             btn_stop.pack(side="left", expand=True, fill="x", padx=5)
 
-            btn_next = tk.Button(control_frame, text="Next Episode (Right/Space)", command=on_click_next, bg="#ccffcc", height=4)
+            btn_next = tk.Button(control_frame, text="Next Episode (Right/Space)", command=on_click_next, bg="#ccffcc", height=3)
             btn_next.pack(side="left", expand=True, fill="x", padx=5)
+
+            # Status bar (below buttons)
+            status_bar = tk.Label(root, text="Status: Idle", bd=1, relief="sunken", anchor="w", font=("Arial", 12))
+            status_bar.pack(side="bottom", fill="x")
 
             root.bind("<Key>", on_key)
             root.attributes("-topmost", True)
 
-            def update_images():
+            def update_ui():
+                nonlocal joint_history, joint_lines
                 try:
-                    # Get all available messages, use the last one
-                    images = None
+                    data = None
                     while True:
-                        images = msg_queue.get_nowait()
+                        data = msg_queue.get_nowait()
                 except queue.Empty:
                     pass
                 except Exception as e:
                     print(f"Error getting from queue: {e}")
 
-                if images:
-                    # Dynamically create labels if new cameras appear
-                    current_keys = sorted(list(images.keys()))
-
-                    # If we haven't set up the grid or keys changed (unlikely but safe)
-                    for idx, key in enumerate(current_keys):
-                        if key not in image_labels:
-                            lbl = tk.Label(video_frame_container, text=key)
-                            lbl.grid(row=idx // 2 * 2, column=idx % 2, sticky="nsew") 
- 
-                            # Image label below text
-                            img_lbl = tk.Label(video_frame_container)
-                            img_lbl.grid(row=idx // 2 * 2 + 1, column=idx % 2, sticky="nsew", padx=5, pady=5)
-                            image_labels[key] = img_lbl
-                            
-                            # Configure grid weights
-                            video_frame_container.grid_columnconfigure(idx % 2, weight=1)
-                            video_frame_container.grid_rowconfigure(idx // 2 * 2 + 1, weight=1)
-
-                    # Update images
-                    for key, img_data in images.items():
-                        if key in image_labels:
+                if data:
+                    # Update cameras
+                    for cam_name, lbl in camera_cells.items():
+                        if cam_name in data:
                             try:
-                                # Convert to PIL
-                                # Handle potential torch tensor
+                                img_data = data[cam_name]
                                 if hasattr(img_data, "cpu"):
                                     img_data = img_data.cpu().numpy()
-                                    
-                                # Handle potential float [0,1]
                                 if img_data.dtype.kind == 'f':
                                     img_data = (img_data * 255).astype("uint8")
-                                
-                                # Handle C, H, W -> H, W, C if needed
-                                # Heuristic: if shape[0] is 3 and shape[2] is not 3, assume CHW
                                 if img_data.ndim == 3 and img_data.shape[0] == 3 and img_data.shape[2] != 3:
                                     img_data = img_data.transpose(1, 2, 0)
-                                    
                                 if img_data.ndim == 3:
-                                    # Resize for display if too large
                                     pim = Image.fromarray(img_data)
-                                    # Optional: resize to fit cell?
-                                    # aspect ratio
                                     w, h = pim.size
-                                    target_w = 320 # Arbitrary small size for grid
+                                    target_w = 350
                                     scale = target_w / w
                                     target_h = int(h * scale)
                                     pim = pim.resize((target_w, target_h))
-                                    
                                     photo = ImageTk.PhotoImage(pim)
-                                    image_labels[key].config(image=photo)
-                                    image_labels[key].image = photo # keep ref
+                                    lbl.config(image=photo)
+                                    lbl.image = photo
                             except Exception as e:
-                                print(f"Error updating image for {key}: {e}")
+                                print(f"Error updating camera {cam_name}: {e}")
 
-                root.after(30, update_images) # ~30fps poll
+                    # Update joint plot
+                    if "__joints__" in data:
+                        joints = data["__joints__"]
+                        for jname, jval in joints.items():
+                            if jname not in joint_history:
+                                joint_history[jname] = deque(maxlen=history_len)
+                            joint_history[jname].append(jval)
+                        
+                        # Update lines
+                        ax.clear()
+                        ax.set_ylim(-3.2, 3.2)
+                        ax.set_xlim(0, history_len)
+                        ax.set_ylabel("Radians")
+                        ax.set_xlabel("Frame")
+                        for jname, hist in joint_history.items():
+                            ax.plot(list(hist), label=jname[:10])
+                        # ax.legend(loc="upper left", fontsize=6)
+                        canvas.draw_idle()
 
-            # Start updating
-            root.after(100, update_images)
-            
+                    # Update status bar
+                    if "__status__" in data:
+                        status_bar.config(text=f"Status: {data['__status__']}")
+
+                root.after(30, update_ui)
+
+            root.after(100, update_ui)
             print("Tkinter control window started. Focus it to use keyboard shortcuts.")
             root.mainloop()
         except Exception as e:
@@ -432,6 +469,7 @@ def record_loop(
     display_data: bool = False,
     display_compressed_images: bool = False,
     msg_queue: queue.Queue | None = None,
+    current_status: str | None = None,
 ):
     if dataset is not None and dataset.fps != fps:
         raise ValueError(f"The dataset fps should be equal to requested fps ({dataset.fps} != {fps}).")
@@ -554,24 +592,31 @@ def record_loop(
             
         # Send images to UI
         if msg_queue is not None:
-            # Filter for images in observation
-            # Keys in obs_processed match camera names (e.g. 'left', 'right')
-            ui_images = {}
+            ui_data = {}
+            # Camera images
             if hasattr(robot, "cameras"):
                 for cam_name in robot.cameras:
                     if cam_name in obs_processed:
-                        ui_images[cam_name] = obs_processed[cam_name]
+                        ui_data[cam_name] = obs_processed[cam_name]
                     elif f"observation.images.{cam_name}" in obs_processed:
-                        # Fallback for some processors
-                        ui_images[cam_name] = obs_processed[f"observation.images.{cam_name}"]
+                        ui_data[cam_name] = obs_processed[f"observation.images.{cam_name}"]
             
             # Fallback if robot.cameras is empty but we have images
-            if not ui_images:
-                 ui_images = {k: v for k, v in obs_processed.items() if "image" in k}
+            if not any(k in ui_data for k in ["left", "right", "middle"]):
+                 ui_data.update({k: v for k, v in obs_processed.items() if "image" in k})
 
-            if ui_images:
+            # Joint values (filter for .pos keys)
+            joints = {k: float(v) for k, v in obs_processed.items() if k.endswith(".pos")}
+            if joints:
+                ui_data["__joints__"] = joints
+
+            # Status from parameter
+            if current_status is not None:
+                ui_data["__status__"] = current_status
+
+            if ui_data:
                 try:
-                    msg_queue.put_nowait(ui_images)
+                    msg_queue.put_nowait(ui_data)
                 except queue.Full:
                     pass
 
@@ -697,6 +742,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     display_data=cfg.display_data,
                     display_compressed_images=display_compressed_images,
                     msg_queue=msg_queue,
+                    current_status=f"Recording Episode {dataset.num_episodes}",
                 )
 
                 # Execute a few seconds without recording to give time to manually reset the environment
@@ -722,6 +768,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         single_task=cfg.dataset.single_task,
                         display_data=cfg.display_data,
                         msg_queue=msg_queue,
+                        current_status="Reset Environment",
                     )
 
                 if events["rerecord_episode"]:
