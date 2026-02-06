@@ -185,7 +185,7 @@ def init_tk_window(events, msg_queue):
             root = tk.Tk()
             root.title("LeRobot Control")
             # Make window larger to fit cameras
-            root.geometry("800x600")
+            root.geometry("800x900")
             print("Tkinter Window Initialized")
 
             # frames for layout
@@ -199,13 +199,13 @@ def init_tk_window(events, msg_queue):
             image_labels = {}
 
             # Buttons
-            btn_rerecord = tk.Button(control_frame, text="Rerecord (Left/BkSp)", command=on_click_rerecord, bg="#ffcccc", height=2)
+            btn_rerecord = tk.Button(control_frame, text="Rerecord (Left/BkSp)", command=on_click_rerecord, bg="#ffcccc", height=4)
             btn_rerecord.pack(side="left", expand=True, fill="x", padx=5)
 
-            btn_stop = tk.Button(control_frame, text="Stop (Esc)", command=on_click_stop, bg="#ff9999", height=2)
+            btn_stop = tk.Button(control_frame, text="Stop (Esc)", command=on_click_stop, bg="#ff9999", height=4)
             btn_stop.pack(side="left", expand=True, fill="x", padx=5)
 
-            btn_next = tk.Button(control_frame, text="Next Episode (Right/Space)", command=on_click_next, bg="#ccffcc", height=2)
+            btn_next = tk.Button(control_frame, text="Next Episode (Right/Space)", command=on_click_next, bg="#ccffcc", height=4)
             btn_next.pack(side="left", expand=True, fill="x", padx=5)
 
             root.bind("<Key>", on_key)
@@ -222,19 +222,12 @@ def init_tk_window(events, msg_queue):
                 except Exception as e:
                     print(f"Error getting from queue: {e}")
 
-                if images:
-                    # DEBUG: Print received keys once or periodically
-                    # print(f"UI Received images: {list(images.keys())}") 
-                    
-                    # Dynamically create labels if new cameras appear
-                    current_keys = sorted(list(images.keys()))
-                    
                     # If we haven't set up the grid or keys changed (unlikely but safe)
                     for idx, key in enumerate(current_keys):
                         if key not in image_labels:
-                            # print(f"DEBUG: Creating label for camera: {key}")
                             lbl = tk.Label(video_frame_container, text=key)
                             lbl.grid(row=idx // 2 * 2, column=idx % 2, sticky="nsew") 
+ 
                             # Image label below text
                             img_lbl = tk.Label(video_frame_container)
                             img_lbl.grid(row=idx // 2 * 2 + 1, column=idx % 2, sticky="nsew", padx=5, pady=5)
@@ -278,9 +271,6 @@ def init_tk_window(events, msg_queue):
                                     image_labels[key].image = photo # keep ref
                             except Exception as e:
                                 print(f"Error updating image for {key}: {e}")
-                else:
-                     # print("DEBUG: No images in queue")
-                     pass
 
                 root.after(30, update_images) # ~30fps poll
 
@@ -575,16 +565,10 @@ def record_loop(
             if not ui_images:
                  ui_images = {k: v for k, v in obs_processed.items() if "image" in k}
 
-            # DEBUG: Diagnose data flow
-            # print(f"DEBUG: obs_processed keys: {list(obs_processed.keys())}")
-            # print(f"DEBUG: ui_images keys: {list(ui_images.keys())}")
-            
             if ui_images:
                 try:
                     msg_queue.put_nowait(ui_images)
-                    # print("DEBUG: Put images in queue")
                 except queue.Full:
-                    # print("DEBUG: Queue full")
                     pass
 
         dt_s = time.perf_counter() - start_loop_t
