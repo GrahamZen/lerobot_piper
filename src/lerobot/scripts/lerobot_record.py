@@ -232,7 +232,7 @@ def init_tk_window(events, msg_queue):
                     # If we haven't set up the grid or keys changed (unlikely but safe)
                     for idx, key in enumerate(current_keys):
                         if key not in image_labels:
-                            print(f"DEBUG: Creating label for camera: {key}")
+                            # print(f"DEBUG: Creating label for camera: {key}")
                             lbl = tk.Label(video_frame_container, text=key)
                             lbl.grid(row=idx // 2 * 2, column=idx % 2, sticky="nsew") 
                             # Image label below text
@@ -561,12 +561,22 @@ def record_loop(
         # Send images to UI
         if msg_queue is not None:
             # Filter for images in observation
-            # obs_processed typically has keys like 'observation.images.laptop' or just 'laptop' depending on processor
-            # We look for 'image' in key
-            ui_images = {k: v for k, v in obs_processed.items() if "image" in k}
+            # Keys in obs_processed match camera names (e.g. 'left', 'right')
+            ui_images = {}
+            if hasattr(robot, "cameras"):
+                for cam_name in robot.cameras:
+                    if cam_name in obs_processed:
+                        ui_images[cam_name] = obs_processed[cam_name]
+                    elif f"observation.images.{cam_name}" in obs_processed:
+                        # Fallback for some processors
+                        ui_images[cam_name] = obs_processed[f"observation.images.{cam_name}"]
             
+            # Fallback if robot.cameras is empty but we have images
+            if not ui_images:
+                 ui_images = {k: v for k, v in obs_processed.items() if "image" in k}
+
             # DEBUG: Diagnose data flow
-            print(f"DEBUG: obs_processed keys: {list(obs_processed.keys())}")
+            # print(f"DEBUG: obs_processed keys: {list(obs_processed.keys())}")
             # print(f"DEBUG: ui_images keys: {list(ui_images.keys())}")
             
             if ui_images:
