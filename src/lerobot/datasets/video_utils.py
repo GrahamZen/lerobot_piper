@@ -452,9 +452,20 @@ def concatenate_video_files(
     stream_map = {}
     for input_stream in input_container.streams:
         if input_stream.type in ("video", "audio", "subtitle"):  # only copy compatible streams
-            stream_map[input_stream.index] = output_container.add_stream_from_template(
-                template=input_stream, opaque=True
-            )
+            # Try add_stream_from_template (PyAV 10+), fallback to manual creation
+            if hasattr(output_container, 'add_stream_from_template'):
+                stream_map[input_stream.index] = output_container.add_stream_from_template(
+                    template=input_stream, opaque=True
+                )
+            else:
+                # Fallback for older PyAV versions
+                codec_name = input_stream.codec_context.name
+                output_stream = output_container.add_stream(codec_name)
+                # Copy codec parameters
+                output_stream.codec_context.options = input_stream.codec_context.options
+                if hasattr(input_stream.codec_context, 'extradata') and input_stream.codec_context.extradata:
+                    output_stream.codec_context.extradata = input_stream.codec_context.extradata
+                stream_map[input_stream.index] = output_stream
 
             # set the time base to the input stream time base (missing in the codec context)
             stream_map[input_stream.index].time_base = input_stream.time_base

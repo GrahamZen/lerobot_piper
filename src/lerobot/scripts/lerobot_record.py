@@ -785,6 +785,13 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     logging.warning("Skipping episode save: No frames recorded.")
                     continue
 
+                # Update status bar to show saving
+                if msg_queue is not None:
+                    try:
+                        msg_queue.put_nowait({"__status__": f"Saving Episode {dataset.num_episodes}..."})
+                    except queue.Full:
+                        pass
+
                 dataset.save_episode()
                 recorded_episodes += 1
     finally:
