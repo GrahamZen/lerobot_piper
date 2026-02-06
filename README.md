@@ -139,6 +139,7 @@ uv run lerobot-record \
   --dataset.episode_time_s=30 \
   --dataset.single_task="Dual arm manipulation task." \
   --display_data=true \
+  --show_control_window=true \
   --dataset.push_to_hub=false
 ```
 
@@ -161,6 +162,7 @@ uv run lerobot-record \
   --dataset.num_episodes=50 \
   --dataset.single_task="Dual arm manipulation task." \
   --display_data=true \
+  --show_control_window=true \
   --dataset.push_to_hub=false
 ```
 

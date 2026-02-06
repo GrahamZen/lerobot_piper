@@ -399,7 +399,7 @@ class RecordConfig:
     # Display data in Rerun visualization
     display_data: bool = False
     # Show the control window with camera feeds, joint plot, and buttons
-    show_control_window: bool = True
+    show_control_window: bool = False
     # Display data on a remote Rerun server
     display_ip: str | None = None
     # Port of the remote Rerun server
