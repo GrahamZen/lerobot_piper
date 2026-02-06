@@ -205,8 +205,6 @@ class PIPERDual(Robot):
     def disconnect(self) -> None:
         """move to home position, disenable piper and cameras"""
 
-
-
         if len(self.cameras) > 0:
             for cam in self.cameras.values():
                 cam.disconnect()
