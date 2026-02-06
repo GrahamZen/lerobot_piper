@@ -15,7 +15,6 @@
 # limitations under the License.
 
 import logging
-import time
 from functools import cached_property
 from typing import Any
 
@@ -205,16 +204,6 @@ class PIPERDual(Robot):
 
     def disconnect(self) -> None:
         """move to home position, disenable piper and cameras"""
-        print("Disconnecting left arm...")
-        self.left_bus.safe_disconnect()
-        print("Disconnecting right arm...")
-        self.right_bus.safe_disconnect()
-
-        print("piper disable after 5 seconds")
-        time.sleep(5)
-
-        self.left_bus.connect(enable=False)
-        self.right_bus.connect(enable=False)
 
         if len(self.cameras) > 0:
             for cam in self.cameras.values():
