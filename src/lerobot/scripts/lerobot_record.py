@@ -382,13 +382,15 @@ class RecordConfig:
     teleop: TeleoperatorConfig | None = None
     # Whether to control the robot with a policy
     policy: PreTrainedConfig | None = None
-    # Display all cameras on screen
+    # Display data in Rerun visualization
     display_data: bool = False
+    # Show the control window with camera feeds, joint plot, and buttons
+    show_control_window: bool = True
     # Display data on a remote Rerun server
     display_ip: str | None = None
     # Port of the remote Rerun server
     display_port: int | None = None
-    # Whether to  display compressed images in Rerun
+    # Whether to display compressed images in Rerun
     display_compressed_images: bool = False
     # Use vocal synthesis to read events.
     play_sounds: bool = True
@@ -713,7 +715,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
         listener, events = init_keyboard_listener()
         msg_queue = None
-        if cfg.display_data:
+        if cfg.show_control_window:
             msg_queue = queue.Queue(maxsize=1)
             init_tk_window(events, msg_queue)
 
