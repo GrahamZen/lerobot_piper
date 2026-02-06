@@ -66,7 +66,9 @@ import logging
 import threading
 import time
 import tkinter as tk
+import queue
 from dataclasses import asdict, dataclass, field
+from PIL import Image, ImageTk
 from pathlib import Path
 from pprint import pformat
 from typing import Any
@@ -149,7 +151,7 @@ from lerobot.utils.utils import (
 from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 
 
-def init_tk_window(events):
+def init_tk_window(events, msg_queue):
     def on_key(event):
         if event.keysym == "Escape":
             print("Tkinter KEY: ESC (Stop)")
@@ -163,21 +165,119 @@ def init_tk_window(events):
             events["rerecord_episode"] = True
             events["exit_early"] = True
 
+    def on_click_next():
+        print("Tkinter BUTTON: Next")
+        events["exit_early"] = True
+
+    def on_click_rerecord():
+        print("Tkinter BUTTON: Rerecord")
+        events["rerecord_episode"] = True
+        events["exit_early"] = True
+
+    def on_click_stop():
+        print("Tkinter BUTTON: Stop")
+        events["stop_recording"] = True
+        events["exit_early"] = True
+
     def run_tk():
         try:
             root = tk.Tk()
             root.title("LeRobot Control")
-            root.geometry("350x150")
-            label = tk.Label(
-                root,
-                text="FOCUS THIS WINDOW FOR CONTROL\n\nSpace/Enter/Right: Next Episode\nEsc: Stop Recording\nBackspace/Left: Rerecord",
-                padx=10,
-                pady=10,
-                justify="left",
-            )
-            label.pack()
+            # Make window larger to fit cameras
+            root.geometry("800x600")
+
+            # frames for layout
+            video_frame_container = tk.Frame(root)
+            video_frame_container.pack(expand=True, fill="both", padx=10, pady=10)
+            
+            control_frame = tk.Frame(root)
+            control_frame.pack(side="bottom", fill="x", padx=10, pady=10)
+
+            # Labels for images
+            image_labels = {}
+
+            # Buttons
+            btn_rerecord = tk.Button(control_frame, text="Rerecord (Left/BkSp)", command=on_click_rerecord, bg="#ffcccc", height=2)
+            btn_rerecord.pack(side="left", expand=True, fill="x", padx=5)
+
+            btn_stop = tk.Button(control_frame, text="Stop (Esc)", command=on_click_stop, bg="#ff9999", height=2)
+            btn_stop.pack(side="left", expand=True, fill="x", padx=5)
+
+            btn_next = tk.Button(control_frame, text="Next Episode (Right/Space)", command=on_click_next, bg="#ccffcc", height=2)
+            btn_next.pack(side="left", expand=True, fill="x", padx=5)
+
             root.bind("<Key>", on_key)
             root.attributes("-topmost", True)
+
+            def update_images():
+                try:
+                    # Get all available messages, use the last one
+                    images = None
+                    while True:
+                        images = msg_queue.get_nowait()
+                except queue.Empty:
+                    pass
+
+                if images:
+                    # 'images' is a dict of key -> numpy array (H, W, C) or torch tensor
+                    # Need to verify format. Assuming standard robot output (H, W, C) uint8 numpy 
+                    # or similar that PIL can handle.
+                    
+                    # Dynamically create labels if new cameras appear
+                    current_keys = list(images.keys())
+                    
+                    # If we haven't set up the grid or keys changed (unlikely but safe)
+                    for idx, key in enumerate(current_keys):
+                        if key not in image_labels:
+                            lbl = tk.Label(video_frame_container, text=key)
+                            lbl.grid(row=idx // 2 * 2, column=idx % 2, sticky="nsew") 
+                            # Image label below text
+                            img_lbl = tk.Label(video_frame_container)
+                            img_lbl.grid(row=idx // 2 * 2 + 1, column=idx % 2, sticky="nsew", padx=5, pady=5)
+                            image_labels[key] = img_lbl
+                            
+                            # Configure grid weights
+                            video_frame_container.grid_columnconfigure(idx % 2, weight=1)
+                            video_frame_container.grid_rowconfigure(idx // 2 * 2 + 1, weight=1)
+
+                    # Update images
+                    for key, img_data in images.items():
+                        if key in image_labels:
+                            # Convert to PIL
+                            # Handle potential torch tensor
+                            if hasattr(img_data, "cpu"):
+                                img_data = img_data.cpu().numpy()
+                            # Handle potential float [0,1]
+                            if img_data.dtype.kind == 'f':
+                                img_data = (img_data * 255).astype("uint8")
+                            
+                            # Handle C, H, W -> H, W, C if needed
+                            # Heuristic: if shape[0] is 3 and shape[2] is not 3, assume CHW
+                            if img_data.ndim == 3 and img_data.shape[0] == 3 and img_data.shape[2] != 3:
+                                img_data = img_data.transpose(1, 2, 0)
+
+                            if img_data.ndim == 3:
+                                # Resize for display if too large? 
+                                # For now let Tkinter maximize, but maybe resize to fixed width for speed
+                                # img_data = cv2.resize(...) if we had cv2
+                                pim = Image.fromarray(img_data)
+                                # Optional: resize to fit cell?
+                                # aspect ratio
+                                w, h = pim.size
+                                target_w = 320 # Arbitrary small size for grid
+                                scale = target_w / w
+                                target_h = int(h * scale)
+                                pim = pim.resize((target_w, target_h))
+                                
+                                photo = ImageTk.PhotoImage(pim)
+                                image_labels[key].config(image=photo)
+                                image_labels[key].image = photo # keep ref
+
+                root.after(30, update_images) # ~30fps poll
+
+            # Start updating
+            root.after(100, update_images)
+            
             print("Tkinter control window started. Focus it to use keyboard shortcuts.")
             root.mainloop()
         except Exception as e:
@@ -328,6 +428,7 @@ def record_loop(
     single_task: str | None = None,
     display_data: bool = False,
     display_compressed_images: bool = False,
+    msg_queue: queue.Queue | None = None,
 ):
     if dataset is not None and dataset.fps != fps:
         raise ValueError(f"The dataset fps should be equal to requested fps ({dataset.fps} != {fps}).")
@@ -447,6 +548,18 @@ def record_loop(
             log_rerun_data(
                 observation=obs_processed, action=action_values, compress_images=display_compressed_images
             )
+            
+        # Send images to UI
+        if msg_queue is not None:
+            # Filter for images in observation
+            # obs_processed typically has keys like 'observation.images.laptop' or just 'laptop' depending on processor
+            # We look for 'image' in key
+            ui_images = {k: v for k, v in obs_processed.items() if "image" in k}
+            if ui_images:
+                try:
+                    msg_queue.put_nowait(ui_images)
+                except queue.Full:
+                    pass
 
         dt_s = time.perf_counter() - start_loop_t
         precise_sleep(max(1 / fps - dt_s, 0.0))
@@ -540,8 +653,10 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             teleop.connect()
 
         listener, events = init_keyboard_listener()
+        msg_queue = None
         if cfg.display_data:
-            init_tk_window(events)
+            msg_queue = queue.Queue(maxsize=1)
+            init_tk_window(events, msg_queue)
 
         with VideoEncodingManager(dataset):
             recorded_episodes = 0
@@ -567,6 +682,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     single_task=cfg.dataset.single_task,
                     display_data=cfg.display_data,
                     display_compressed_images=display_compressed_images,
+                    msg_queue=msg_queue,
                 )
 
                 # Execute a few seconds without recording to give time to manually reset the environment
@@ -591,6 +707,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         control_time_s=cfg.dataset.reset_time_s,
                         single_task=cfg.dataset.single_task,
                         display_data=cfg.display_data,
+                        msg_queue=msg_queue,
                     )
 
                 if events["rerecord_episode"]:
