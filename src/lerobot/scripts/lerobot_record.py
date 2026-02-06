@@ -186,6 +186,7 @@ def init_tk_window(events, msg_queue):
             root.title("LeRobot Control")
             # Make window larger to fit cameras
             root.geometry("800x600")
+            print("Tkinter Window Initialized")
 
             # frames for layout
             video_frame_container = tk.Frame(root)
@@ -231,7 +232,7 @@ def init_tk_window(events, msg_queue):
                     # If we haven't set up the grid or keys changed (unlikely but safe)
                     for idx, key in enumerate(current_keys):
                         if key not in image_labels:
-                            print(f"Creating label for camera: {key}")
+                            print(f"DEBUG: Creating label for camera: {key}")
                             lbl = tk.Label(video_frame_container, text=key)
                             lbl.grid(row=idx // 2 * 2, column=idx % 2, sticky="nsew") 
                             # Image label below text
@@ -277,6 +278,9 @@ def init_tk_window(events, msg_queue):
                                     image_labels[key].image = photo # keep ref
                             except Exception as e:
                                 print(f"Error updating image for {key}: {e}")
+                else:
+                     # print("DEBUG: No images in queue")
+                     pass
 
                 root.after(30, update_images) # ~30fps poll
 
@@ -560,12 +564,17 @@ def record_loop(
             # obs_processed typically has keys like 'observation.images.laptop' or just 'laptop' depending on processor
             # We look for 'image' in key
             ui_images = {k: v for k, v in obs_processed.items() if "image" in k}
-            # DEBUG: Print sent keys occasionally
-            # if ui_images: print(f"Sending keys: {list(ui_images.keys())}")
+            
+            # DEBUG: Diagnose data flow
+            print(f"DEBUG: obs_processed keys: {list(obs_processed.keys())}")
+            # print(f"DEBUG: ui_images keys: {list(ui_images.keys())}")
+            
             if ui_images:
                 try:
                     msg_queue.put_nowait(ui_images)
+                    # print("DEBUG: Put images in queue")
                 except queue.Full:
+                    # print("DEBUG: Queue full")
                     pass
 
         dt_s = time.perf_counter() - start_loop_t
