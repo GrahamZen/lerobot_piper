@@ -62,19 +62,21 @@ lerobot-record \
 ```
 """
 
+import contextlib
 import logging
+import queue
 import threading
 import time
 import tkinter as tk
-import queue
 from collections import deque
 from dataclasses import asdict, dataclass, field
-from PIL import Image, ImageTk
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from matplotlib.figure import Figure
 from pathlib import Path
 from pprint import pformat
 from typing import Any
+
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
+from PIL import Image, ImageTk
 
 from lerobot.cameras import (  # noqa: F401
     CameraConfig,  # noqa: F401
@@ -202,11 +204,11 @@ def init_tk_window(events, msg_queue):
             # Cell (0,1): right camera
             # Cell (1,0): middle camera
             # Cell (1,1): joint plot
-            
+
             camera_cells = {}
             cell_positions = [(0, 0), (0, 1), (1, 0)]
             camera_names = ["left", "right", "middle"]
-            for name, (r, c) in zip(camera_names, cell_positions):
+            for name, (r, c) in zip(camera_names, cell_positions, strict=False):
                 cell_frame = tk.Frame(video_frame_container, bd=1, relief="solid")
                 cell_frame.grid(row=r, column=c, sticky="nsew", padx=2, pady=2)
                 lbl_title = tk.Label(cell_frame, text=name, font=("Arial", 10, "bold"))
@@ -230,7 +232,7 @@ def init_tk_window(events, msg_queue):
             fig.tight_layout()
             canvas = FigureCanvasTkAgg(fig, master=plot_frame)
             canvas.get_tk_widget().pack(expand=True, fill="both")
-            
+
             # Store line objects for each joint
             joint_lines = {}
             joint_history = {}  # {joint_name: deque of values}
@@ -240,17 +242,29 @@ def init_tk_window(events, msg_queue):
             control_frame = tk.Frame(root)
             control_frame.pack(side="bottom", fill="x", padx=10, pady=5)
 
-            btn_rerecord = tk.Button(control_frame, text="Rerecord (Left/BkSp)", command=on_click_rerecord, bg="#ffcccc", height=3)
+            btn_rerecord = tk.Button(
+                control_frame, text="Rerecord (Left/BkSp)", command=on_click_rerecord, bg="#ffcccc", height=3
+            )
             btn_rerecord.pack(side="left", expand=True, fill="x", padx=5)
 
-            btn_stop = tk.Button(control_frame, text="Stop (Esc)", command=on_click_stop, bg="#ff9999", height=3)
+            btn_stop = tk.Button(
+                control_frame, text="Stop (Esc)", command=on_click_stop, bg="#ff9999", height=3
+            )
             btn_stop.pack(side="left", expand=True, fill="x", padx=5)
 
-            btn_next = tk.Button(control_frame, text="Next Episode (Right/Space)", command=on_click_next, bg="#ccffcc", height=3)
+            btn_next = tk.Button(
+                control_frame,
+                text="Next Episode (Right/Space)",
+                command=on_click_next,
+                bg="#ccffcc",
+                height=3,
+            )
             btn_next.pack(side="left", expand=True, fill="x", padx=5)
 
             # Status bar (below buttons)
-            status_bar = tk.Label(root, text="Status: Idle", bd=1, relief="sunken", anchor="w", font=("Arial", 12))
+            status_bar = tk.Label(
+                root, text="Status: Idle", bd=1, relief="sunken", anchor="w", font=("Arial", 12)
+            )
             status_bar.pack(side="bottom", fill="x")
 
             root.bind("<Key>", on_key)
@@ -275,7 +289,7 @@ def init_tk_window(events, msg_queue):
                                 img_data = data[cam_name]
                                 if hasattr(img_data, "cpu"):
                                     img_data = img_data.cpu().numpy()
-                                if img_data.dtype.kind == 'f':
+                                if img_data.dtype.kind == "f":
                                     img_data = (img_data * 255).astype("uint8")
                                 if img_data.ndim == 3 and img_data.shape[0] == 3 and img_data.shape[2] != 3:
                                     img_data = img_data.transpose(1, 2, 0)
@@ -299,7 +313,7 @@ def init_tk_window(events, msg_queue):
                             if jname not in joint_history:
                                 joint_history[jname] = deque(maxlen=history_len)
                             joint_history[jname].append(jval)
-                        
+
                         # Update lines
                         ax.clear()
                         ax.set_ylim(-3.2, 3.2)
@@ -591,7 +605,7 @@ def record_loop(
             log_rerun_data(
                 observation=obs_processed, action=action_values, compress_images=display_compressed_images
             )
-            
+
         # Send images to UI
         if msg_queue is not None:
             ui_data = {}
@@ -602,10 +616,10 @@ def record_loop(
                         ui_data[cam_name] = obs_processed[cam_name]
                     elif f"observation.images.{cam_name}" in obs_processed:
                         ui_data[cam_name] = obs_processed[f"observation.images.{cam_name}"]
-            
+
             # Fallback if robot.cameras is empty but we have images
             if not any(k in ui_data for k in ["left", "right", "middle"]):
-                 ui_data.update({k: v for k, v in obs_processed.items() if "image" in k})
+                ui_data.update({k: v for k, v in obs_processed.items() if "image" in k})
 
             # Joint values (filter for .pos keys)
             joints = {k: float(v) for k, v in obs_processed.items() if k.endswith(".pos")}
@@ -617,10 +631,8 @@ def record_loop(
                 ui_data["__status__"] = current_status
 
             if ui_data:
-                try:
+                with contextlib.suppress(queue.Full):
                     msg_queue.put_nowait(ui_data)
-                except queue.Full:
-                    pass
 
         dt_s = time.perf_counter() - start_loop_t
         precise_sleep(max(1 / fps - dt_s, 0.0))
@@ -787,10 +799,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
                 # Update status bar to show saving
                 if msg_queue is not None:
-                    try:
+                    with contextlib.suppress(queue.Full):
                         msg_queue.put_nowait({"__status__": f"Saving Episode {dataset.num_episodes}..."})
-                    except queue.Full:
-                        pass
 
                 dataset.save_episode()
                 recorded_episodes += 1
