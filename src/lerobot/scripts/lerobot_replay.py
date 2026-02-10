@@ -62,8 +62,6 @@ from lerobot.robots import (  # noqa: F401
     omx_follower,
     openarm_follower,
     piper_dual,
-    piper_follower,
-    piper_slave,
     reachy2,
     so_follower,
     unitree_g1,
