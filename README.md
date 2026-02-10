@@ -423,6 +423,23 @@ nohup accelerate launch --num_processes=8 \
 
 ### Local Inference
 
+uv run lerobot-record \
+ --robot.type=piper_dual \
+ --robot.left_port=can_left \
+ --robot.right_port=can_right \
+ --robot.cameras='{
+"left":{"type":"opencv","index_or_path":"/dev/video12","width":640,"height":480,"fps":30,"rotation":0},
+"right":{"type":"opencv","index_or_path":"/dev/video4","width":640,"height":480,"fps":30,"rotation":0},
+"middle":{"type":"opencv","index_or_path":"/dev/video6","width":640,"height":480,"fps":30,"rotation":0}
+}' \
+ --dataset.repo_id=local/eval_pi0_pick_and_place \
+ --dataset.num_episodes=5 \
+ --policy.type=pi0 \
+ --policy.pretrained_path=/home/droplab/workspace/lerobot_piper/outputs/pi0_training_50000/pi0_training_50000/checkpoints/last/pretrained_model \
+ --dataset.single_task="pick_and_place" \
+ --display_data=true \
+ --dataset.push_to_hub=false
+
 #### RTC
 
 Pretrained

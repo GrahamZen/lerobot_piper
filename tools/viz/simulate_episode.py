@@ -27,10 +27,10 @@ from lerobot.policies.factory import make_pre_post_processors
 # DEFAULT_DATASET_ID = "lerobot_pick_and_place"
 
 DEFAULT_PRETRAINED_MODEL_PATH = Path(
-    "/home/droplab/workspace/lerobot_piper/outputs/train/lerobot_fold_towel_50chunksz/checkpoints/last/pretrained_model"
+    "/home/droplab/workspace/lerobot_piper/outputs/train/lerobot_cup_and_saucer/checkpoints/last/pretrained_model"
 )
-DEFAULT_DATASET_ROOT = Path("/home/droplab/.cache/huggingface/lerobot/local/lerobot_fold_towel")
-DEFAULT_DATASET_ID = "lerobot_fold_towel"
+DEFAULT_DATASET_ROOT = Path("/home/droplab/.cache/huggingface/lerobot/local/lerobot_cup_and_saucer")
+DEFAULT_DATASET_ID = "lerobot_cup_and_saucer"
 
 
 class PiperFK:

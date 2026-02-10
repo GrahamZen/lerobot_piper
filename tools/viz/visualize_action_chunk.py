@@ -23,10 +23,10 @@ from lerobot.policies.factory import make_pre_post_processors
 
 # Defaults
 DEFAULT_PRETRAINED_MODEL_PATH = Path(
-    "/home/droplab/workspace/lerobot_piper/outputs/train/lerobot_pick_and_place_50/checkpoints/last/pretrained_model"
+    "/home/droplab/workspace/lerobot_piper/outputs/train/lerobot_long_horizon_test1/checkpoints/last/pretrained_model"
 )
-DEFAULT_DATASET_ROOT = Path("/home/droplab/.cache/huggingface/lerobot/local/lerobot_pick_and_place")
-DEFAULT_DATASET_ID = "lerobot_pick_and_place"
+DEFAULT_DATASET_ROOT = Path("/home/droplab/.cache/huggingface/lerobot/local/lerobot_long_horizon_merged")
+DEFAULT_DATASET_ID = "lerobot_long_horizon_merge"
 
 
 class PiperFK:
