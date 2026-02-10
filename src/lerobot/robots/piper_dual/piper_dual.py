@@ -19,7 +19,7 @@ from functools import cached_property
 from typing import Any
 
 from lerobot.cameras.utils import make_cameras_from_configs
-from lerobot.motors.piper.piper_custom import PiperMotorsBus, PiperMotorsBusConfig
+from lerobot.motors.piper.piper_slave import PiperMotorsBus, PiperMotorsBusConfig
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 
 from ..robot import Robot
@@ -237,10 +237,6 @@ class PIPERDual(Robot):
         for name, cam in self.cameras.items():
             obs_dict[name] = cam.async_read()
 
-        # DEBUG: unexpected output request
-        # if "left_joint_1.pos" in obs_dict:
-        #      print(f"DEBUG JS: L={obs_dict['left_joint_1.pos']:.2f}, R={obs_dict['right_joint_1.pos']:.2f}")
-
         return obs_dict
 
     def send_action(self, action: dict[str, float]) -> dict[str, float]:
@@ -256,7 +252,6 @@ class PIPERDual(Robot):
             # Assume format is [left_7_joints, right_7_joints]
             raw_action = action["action"]
             if len(raw_action) == 14:
-                #  print("DEBUG: Detected legacy action array, parsing manually.")
                 left_target_joints = raw_action[:7]
                 right_target_joints = raw_action[7:]
             else:
