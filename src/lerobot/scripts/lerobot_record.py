@@ -132,6 +132,7 @@ from lerobot.teleoperators import (  # noqa: F401
     make_teleoperator_from_config,
     omx_leader,
     openarm_leader,
+    piper_dual_leader,
     piper_leader,
     reachy2_teleoperator,
     so_leader,
@@ -570,10 +571,8 @@ def record_loop(
         else:
             # PASSIVE MODE: Use robot observation as action
             # This supports hardware-level teleoperation
+            # For hardware teleop with piper_dual, use --teleop.type=piper_dual_leader
             act = {k: v for k, v in obs.items() if "pos" in k}
-            # Rename keys if necessary or assume processor handles it?
-            # Usually processor expects specific keys. IdentityProcessor is default.
-            # We assume obs keys match action keys for simple joints.
             act_processed_teleop = teleop_action_processor((act, obs))
 
         # Applies a pipeline to the action, default is IdentityProcessor

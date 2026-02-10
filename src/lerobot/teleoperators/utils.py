@@ -47,6 +47,10 @@ def make_teleoperator_from_config(config: TeleoperatorConfig) -> "Teleoperator":
         from .piper_leader import PIPERLeader
 
         return PIPERLeader(config)
+    elif config.type == "piper_dual_leader":
+        from .piper_dual_leader import PIPERDualLeader
+
+        return PIPERDualLeader(config)
     elif config.type == "omx_leader":
         from .omx_leader import OmxLeader
 
