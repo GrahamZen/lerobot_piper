@@ -107,40 +107,46 @@ uv run lerobot-record \
   --robot.type=piper_dual \
   --robot.left_port=can_left \
   --robot.right_port=can_right \
+  --teleop.type=piper_dual_leader \
+  --teleop.left_port=can_left \
+  --teleop.right_port=can_right \
   --robot.read_only=true \
   --robot.cameras='{
       "left": {
         "type": "opencv",
-        "index_or_path": "/dev/video12",
+        "index_or_path": "/dev/video14",
         "width": 640,
         "height": 480,
-        "fps": 30,
+        "fps": 60,
         "rotation": 0
       },
       "right": {
         "type": "opencv",
-        "index_or_path": "/dev/video4",
+        "index_or_path": "/dev/video10",
         "width": 640,
         "height": 480,
-        "fps": 30,
+        "fps": 60,
         "rotation": 0
       },
       "middle": {
         "type": "opencv",
-        "index_or_path": "/dev/video6",
+        "index_or_path": "/dev/video16",
         "width": 640,
-        "height": 480,
-        "fps": 30,
+        "height": 360,
+        "fps": 60,
         "rotation": 0
       }
     }' \
   --dataset.repo_id=local/lerobot_new_dataset \
   --dataset.num_episodes=50 \
   --dataset.episode_time_s=30 \
+  --dataset.reset_time_s=500 \
   --dataset.single_task="Dual arm manipulation task." \
-  --display_data=true \
+  --display_data=false \
   --show_control_window=true \
-  --dataset.push_to_hub=false
+  --dataset.fps=60 \
+  --dataset.push_to_hub=false \
+  --dataset.num_image_writer_threads_per_camera=8
 ```
 
 _Note: Adjust `episode_time_s` to match your task length since you cannot use keyboard shortcuts in headless mode._
