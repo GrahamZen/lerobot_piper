@@ -199,6 +199,7 @@ def init_tk_window(events, msg_queue):
             video_frame_container.grid_columnconfigure(2, weight=1)
             video_frame_container.grid_rowconfigure(0, weight=1)  # Cameras
             video_frame_container.grid_rowconfigure(1, weight=1)  # Plot
+            video_frame_container.grid_propagate(False)  # Prevent child widgets from resizing this frame
 
             # Cameras on Row 0: Left, Middle, Right
             camera_cells = {}
@@ -208,6 +209,7 @@ def init_tk_window(events, msg_queue):
             for cam_name, col_idx in camera_layout:
                 cell_frame = tk.Frame(video_frame_container, bd=1, relief="solid")
                 cell_frame.grid(row=0, column=col_idx, sticky="nsew", padx=2, pady=2)
+                cell_frame.pack_propagate(False)  # Prevent image from resizing the frame
 
                 lbl_title = tk.Label(cell_frame, text=f"Camera: {cam_name}", font=("Arial", 10, "bold"))
                 lbl_title.pack(side="top")
@@ -222,6 +224,7 @@ def init_tk_window(events, msg_queue):
             # Joint plot on Row 1, spanning all 3 columns
             plot_frame = tk.Frame(video_frame_container, bd=1, relief="solid")
             plot_frame.grid(row=1, column=0, columnspan=3, sticky="nsew", padx=2, pady=2)
+            plot_frame.pack_propagate(False)  # Prevent plot from resizing the frame
 
             lbl_plot_title = tk.Label(plot_frame, text="Joint Values", font=("Arial", 10, "bold"))
             lbl_plot_title.pack(side="top")
