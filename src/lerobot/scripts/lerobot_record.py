@@ -63,6 +63,7 @@ lerobot-record \
 """
 
 import contextlib
+import json
 import logging
 import queue
 import threading
@@ -739,6 +740,18 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 batch_encoding_size=cfg.dataset.video_encoding_batch_size,
                 vcodec=cfg.dataset.vcodec,
             )
+
+        # Save the full configuration to the dataset directory
+        if dataset is not None and dataset.root is not None:
+            try:
+                meta_dir = Path(dataset.root) / "meta"
+                meta_dir.mkdir(parents=True, exist_ok=True)
+                config_path = meta_dir / "record_config.json"
+                with open(config_path, "w") as f:
+                    json.dump(asdict(cfg), f, indent=4, default=str)
+                logging.info(f"Saved recording config to {config_path}")
+            except Exception as e:
+                logging.warning(f"Failed to save recording config: {e}")
 
         # Load pretrained policy
         policy = None if cfg.policy is None else make_policy(cfg.policy, ds_meta=dataset.meta)
