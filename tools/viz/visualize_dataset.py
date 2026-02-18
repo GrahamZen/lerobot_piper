@@ -1,5 +1,16 @@
 """
-Usage: python visualize_dataset.py --repo_id=local/lerobot_pick_and_place
+This script streams an entire LeRobot dataset to Rerun for continuous visualization.
+It renders camera streams and the robot's 3D posture across all episodes in a single timeline.
+
+Key Features:
+- Continuous playback: Automatically scrolls through all episodes in the dataset.
+- 3D Visualization: Uses forward kinematics to render the robot's arm and gripper state.
+- Global Timeline: Displays a "global_step" timeline for the entire dataset plus per-episode steps.
+- Episode Overlays: Shows the current episode index as a large 3D text overlay.
+- Stride control: Adjust the playback speed using the --stride argument.
+
+Usage:
+    python tools/viz/visualize_dataset.py --repo_id local/lerobot_pick_and_place --stride 7
 """
 
 import argparse
