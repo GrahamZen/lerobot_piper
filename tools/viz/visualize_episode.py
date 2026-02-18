@@ -191,6 +191,7 @@ def visualize_episode(repo_id, episode_idx, root=None):
 
         if act is not None:
             rr.log("vectors/action_tensor", rr.Tensor(act))
+            rr.log("vectors/action_text", rr.TextDocument(str(act.tolist())))
 
             if len(act) >= 14:
                 # Left Arm
