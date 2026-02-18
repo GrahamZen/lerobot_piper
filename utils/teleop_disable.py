@@ -7,8 +7,8 @@ from piper_sdk import C_PiperInterface_V2
 
 # 测试代码
 if __name__ == "__main__":
-    piper_1 = C_PiperInterface_V2("can_master", judge_flag=True)  # type: ignore
-    piper_2 = C_PiperInterface_V2("can_follower", judge_flag=True)  # type: ignore
+    piper_1 = C_PiperInterface_V2("can_left", judge_flag=True)  # type: ignore
+    piper_2 = C_PiperInterface_V2("can_right", judge_flag=True)  # type: ignore
     piper_1.ConnectPort()
     piper_2.ConnectPort()
 

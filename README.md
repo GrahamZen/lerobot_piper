@@ -11,7 +11,7 @@ uv sync
 
 ## 2. Test Cameras
 
-Use `lerobot-find-cameras` to identify device nodes.
+Use `lerobot-find-cameras` to identify device nodes. If using Intel Realsense, use `realsense-viewer` to test.
 
 Note: Two cameras cannot be connected to the computer via the same hub, otherwise there may be reading issues.
 
@@ -93,9 +93,8 @@ echo $HF_USER
 Upload dataset to Hugging Face
 
 ```bash
-hf upload jokeru/pick_and_place ~/.cache/huggingface/lerobot/jokeru/pick_and_place \
-  --repo-type dataset \
-  --revision "v3.0"
+hf upload jokeru/pick_and_place ~/.cache/huggingface/lerobot/local/lerobot_simple_cups \
+  --repo-type dataset
 ```
 
 ## 6. Data Collection
@@ -107,11 +106,14 @@ uv run lerobot-record \
   --robot.type=piper_dual \
   --robot.left_port=can_left \
   --robot.right_port=can_right \
+  --teleop.type=piper_dual_leader \
+  --teleop.left_port=can_left \
+  --teleop.right_port=can_right \
   --robot.read_only=true \
   --robot.cameras='{
       "left": {
         "type": "opencv",
-        "index_or_path": "/dev/video12",
+        "index_or_path": "/dev/video14",
         "width": 640,
         "height": 480,
         "fps": 30,
@@ -119,7 +121,7 @@ uv run lerobot-record \
       },
       "right": {
         "type": "opencv",
-        "index_or_path": "/dev/video4",
+        "index_or_path": "/dev/video10",
         "width": 640,
         "height": 480,
         "fps": 30,
@@ -127,20 +129,22 @@ uv run lerobot-record \
       },
       "middle": {
         "type": "opencv",
-        "index_or_path": "/dev/video6",
+        "index_or_path": "/dev/video16",
         "width": 640,
         "height": 480,
         "fps": 30,
         "rotation": 0
-      }
+      }kl_weight
     }' \
   --dataset.repo_id=local/lerobot_new_dataset \
   --dataset.num_episodes=50 \
-  --dataset.episode_time_s=30 \
+  --dataset.episode_time_s=500 \
+  --dataset.reset_time_s=500 \
   --dataset.single_task="Dual arm manipulation task." \
-  --display_data=true \
+  --display_data=false \
   --show_control_window=true \
-  --dataset.push_to_hub=false
+  --dataset.push_to_hub=false \
+  --dataset.num_image_writer_threads_per_camera=8
 ```
 
 _Note: Adjust `episode_time_s` to match your task length since you cannot use keyboard shortcuts in headless mode._
@@ -172,6 +176,7 @@ uv run lerobot-record \
   --dataset.episode_time_s=60 Duration of each episode recording (default 60 seconds), can be ended early.
   --dataset.reset_time_s=60 Duration to reset the environment after each episode (default 60 seconds).
   --dataset.num_episodes=50 Total number of episodes to record (default 50).
+  --show_control_window=true Enables the OpenCV control window to capture keyboard shortcuts during recording.
 ```
 
 ### Control data collection using keyboard shortcuts
@@ -214,7 +219,6 @@ HF_LEROBOT_HOME=$HOME/.cache/huggingface/lerobot uv run python -c "from lerobot.
 Verify the recorded data (cameras and joint positions) using rerun.io. This will open a rerun window where you can inspect `observation/images` and `observation/state`. This uses lerobot.
 
 ```bash
-
 uv run lerobot-dataset-viz --repo-id local/lerobot_new_dataset --root ~/.cache/huggingface/lerobot/local/lerobot_new_dataset --episode-index 0
 ```
 
@@ -307,7 +311,6 @@ uv run lerobot-train \
   --policy.n_action_steps=50 \
   --steps=100000 \
   --save_freq=10000 \
-  --dataset.image_transforms.enable=true
 ```
 
 ### Upload model or checkpoints to Hugging Face

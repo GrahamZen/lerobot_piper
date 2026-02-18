@@ -92,12 +92,18 @@ class PIPERDual(Robot):
         # Left Arm
         left_arm_dict = {"follower": self.left_bus}
         left_action_names = [f"left_{name}" for name in get_motor_names(left_arm_dict)]
-        left_state_names = [f"left_{name}" for name in get_motor_names(left_arm_dict)]
+        left_state_names = []
+        for name in get_motor_names(left_arm_dict):
+            left_state_names.append(f"left_{name}.pos")
+            left_state_names.append(f"left_{name}.effort")
 
         # Right Arm
         right_arm_dict = {"follower": self.right_bus}
         right_action_names = [f"right_{name}" for name in get_motor_names(right_arm_dict)]
-        right_state_names = [f"right_{name}" for name in get_motor_names(right_arm_dict)]
+        right_state_names = []
+        for name in get_motor_names(right_arm_dict):
+            right_state_names.append(f"right_{name}.pos")
+            right_state_names.append(f"right_{name}.effort")
 
         action_names = left_action_names + right_action_names
         state_names = left_state_names + right_state_names
@@ -116,8 +122,8 @@ class PIPERDual(Robot):
         }
 
     @property
-    def _motors_ft(self) -> dict[str, type]:
-        """用于 record/replay 的电机动作描述"""
+    def _motors_action_ft(self) -> dict[str, type]:
+        """Description of motor actions (position only)"""
         left_arm_dict = {"follower": self.left_bus}
         left_motor_names = get_motor_names(left_arm_dict)
 
@@ -129,6 +135,24 @@ class PIPERDual(Robot):
             features[f"left_{name}.pos"] = float
         for name in right_motor_names:
             features[f"right_{name}.pos"] = float
+        return features
+
+    @property
+    def _motors_state_ft(self) -> dict[str, type]:
+        """Description of motor state for observations (position + effort)"""
+        left_arm_dict = {"follower": self.left_bus}
+        left_motor_names = get_motor_names(left_arm_dict)
+
+        right_arm_dict = {"follower": self.right_bus}
+        right_motor_names = get_motor_names(right_arm_dict)
+
+        features = {}
+        for name in left_motor_names:
+            features[f"left_{name}.pos"] = float
+            features[f"left_{name}.effort"] = float
+        for name in right_motor_names:
+            features[f"right_{name}.pos"] = float
+            features[f"right_{name}.effort"] = float
 
         return features
 
@@ -139,11 +163,11 @@ class PIPERDual(Robot):
 
     @cached_property
     def action_features(self) -> dict[str, type]:
-        return self._motors_ft
+        return self._motors_action_ft
 
     @cached_property
     def observation_features(self) -> dict[str, type | tuple]:
-        return {**self._motors_ft, **self._cameras_ft}
+        return {**self._motors_state_ft, **self._cameras_ft}
 
     def configure(self, **kwargs):
         pass
@@ -227,11 +251,21 @@ class PIPERDual(Robot):
 
         # Read left arm
         left_state = self.left_bus.read()
-        obs_dict = {f"left_{joint}.pos": float(val) for joint, val in left_state.items()}
+        # left_state keys are like "joint_1_pos", "joint_1_effort"
+        # Convert to f"left_{joint}.pos" and f"left_{joint}.effort"
+        obs_dict = {}
+        for key, val in left_state.items():
+            # key: "joint_1_pos" -> "joint_1.pos"
+            suffix = key.rsplit("_", 1)
+            new_key = f"{suffix[0]}.{suffix[1]}"
+            obs_dict[f"left_{new_key}"] = float(val)
 
         # Read right arm
         right_state = self.right_bus.read()
-        obs_dict.update({f"right_{joint}.pos": float(val) for joint, val in right_state.items()})
+        for key, val in right_state.items():
+            suffix = key.rsplit("_", 1)
+            new_key = f"{suffix[0]}.{suffix[1]}"
+            obs_dict[f"right_{new_key}"] = float(val)
 
         # Read cameras
         for name, cam in self.cameras.items():

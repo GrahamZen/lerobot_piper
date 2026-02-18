@@ -134,20 +134,49 @@ class PiperMotorsBus:
         - 机械臂关节消息,单位0.001度
         - 机械臂夹爪消息
         """
+        # Get high speed info which contains effort
+        # motor_x: ArmMsgFeedbackHighSpd
+        #   - motor_speed (int): (0.001rad/s)
+        #   - current (int): (0.001A)
+        #   - pos (int): (rad) ? Documentation says rad but let's check values.
+        #     Actually SDK documentation says:
+        #     pos (int): Motor Position (rad).
+        #     But GetArmJointMsgs returns 0.001 degrees.
+        #     Let's stick to GetArmJointMsgs for position to be safe and consistent with existing code,
+        #     and use GetArmHighSpdInfoMsgs ONLY for effort if needed, or check if we can get everything from one.
+        #     Wait, existing code uses GetArmJointMsgs for position.
+        #     GetArmHighSpdInfoMsgs has effort.
+
         joint_msg = self.piper.GetArmJointMsgs()
         joint_state = joint_msg.joint_state
 
         gripper_msg = self.piper.GetArmGripperMsgs()
         gripper_state = gripper_msg.gripper_state
 
+        # Read effort from high speed info
+        # The SDK documentation says GetArmHighSpdInfoMsgs returns info for all motors?
+        # definition: def GetArmHighSpdInfoMsgs(self)
+        # returns motor_1, motor_2, ... motor_6
+        high_spd_msg = self.piper.GetArmHighSpdInfoMsgs()
+
+        # Effort unit in SDK: 0.001 N/m (likely N*m)
+        # We generally want float values.
+
         return {
-            "joint_1": joint_state.joint_1 / self.joint_factor,
-            "joint_2": joint_state.joint_2 / self.joint_factor,
-            "joint_3": joint_state.joint_3 / self.joint_factor,
-            "joint_4": joint_state.joint_4 / self.joint_factor,
-            "joint_5": joint_state.joint_5 / self.joint_factor,
-            "joint_6": joint_state.joint_6 / self.joint_factor,
-            "gripper": gripper_state.grippers_angle / 1000000.0,
+            "joint_1_pos": joint_state.joint_1 / self.joint_factor,
+            "joint_2_pos": joint_state.joint_2 / self.joint_factor,
+            "joint_3_pos": joint_state.joint_3 / self.joint_factor,
+            "joint_4_pos": joint_state.joint_4 / self.joint_factor,
+            "joint_5_pos": joint_state.joint_5 / self.joint_factor,
+            "joint_6_pos": joint_state.joint_6 / self.joint_factor,
+            "gripper_pos": gripper_state.grippers_angle / 1000000.0,
+            "joint_1_effort": high_spd_msg.motor_1.effort / 1000.0,
+            "joint_2_effort": high_spd_msg.motor_2.effort / 1000.0,
+            "joint_3_effort": high_spd_msg.motor_3.effort / 1000.0,
+            "joint_4_effort": high_spd_msg.motor_4.effort / 1000.0,
+            "joint_5_effort": high_spd_msg.motor_5.effort / 1000.0,
+            "joint_6_effort": high_spd_msg.motor_6.effort / 1000.0,
+            "gripper_effort": gripper_state.grippers_effort / 1000.0,
         }
 
     def safe_disconnect(self):
