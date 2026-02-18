@@ -1,5 +1,18 @@
 """
-Usage: python visualize_episode.py --repo_id=local/lerobot_pick_and_place --episode=0
+This script streams a single episode from a LeRobot dataset to Rerun for visualization.
+It provides a detailed view of the recorded camera streams, robot state, and actions.
+
+Key Features:
+- Episode-specific view: Focuses on a single episode index for deep inspection.
+- 3D Visualization: Renders the robot's posture (arm and gripper) using forward kinematics.
+- Multi-camera support: Synchronizes and displays all available camera views for the episode.
+- Data Plotting: Logs action and observation values over time to Rerun for trajectory analysis.
+- Rerun Integration: Uses Rerun's timeline and 3D space for an interactive experience.
+
+Usage:
+    python tools/viz/visualize_episode.py \
+        --repo_id local/lerobot_pick_and_place \
+        --episode 0
 """
 
 import argparse
@@ -191,6 +204,7 @@ def visualize_episode(repo_id, episode_idx, root=None):
 
         if act is not None:
             rr.log("vectors/action_tensor", rr.Tensor(act))
+            rr.log("vectors/action_text", rr.TextDocument(str(act.tolist())))
 
             if len(act) >= 14:
                 # Left Arm

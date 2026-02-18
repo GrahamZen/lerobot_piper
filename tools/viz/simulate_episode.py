@@ -27,10 +27,10 @@ from lerobot.policies.factory import make_pre_post_processors
 # DEFAULT_DATASET_ID = "lerobot_pick_and_place"
 
 DEFAULT_PRETRAINED_MODEL_PATH = Path(
-    "/home/droplab/workspace/lerobot_piper/outputs/train/lerobot_cup_and_saucer/checkpoints/last/pretrained_model"
+    "/home/droplab/workspace/lerobot_piper/outputs/train/lerobot_long_horizon_cup_torque_spact/checkpoints/last/pretrained_model"
 )
-DEFAULT_DATASET_ROOT = Path("/home/droplab/.cache/huggingface/lerobot/local/lerobot_cup_and_saucer")
-DEFAULT_DATASET_ID = "lerobot_cup_and_saucer"
+DEFAULT_DATASET_ROOT = Path("/home/droplab/.cache/huggingface/lerobot/local/lerobot_long_horizon_cup_torque")
+DEFAULT_DATASET_ID = "lerobot_long_horizon_cup_torque"
 
 
 class PiperFK:
@@ -259,7 +259,6 @@ def main():
     print("Initializing Piper simulation...")
     fk = PiperFK()
     fk.log_initial_meshes("simulation/prediction/left_arm")
-    fk.log_initial_meshes("simulation/prediction/left_arm")
     fk.log_initial_meshes("simulation/prediction/right_arm")
 
     # Output Directory
@@ -280,7 +279,13 @@ def main():
             item = dataset[current_frame_idx]
 
             # Log images at the start of the chunk
+            # Log images at the start of the chunk
             image_keys = [k for k in item if "image" in k]
+
+            # Log available keys to Rerun for debugging
+            rr.set_time_sequence("step", global_step)
+            rr.log("debug/image_keys", rr.TextDocument(str(image_keys)))
+
             for key in sorted(image_keys):
                 img_tensor = item[key]
                 # Convert (C, H, W) -> (H, W, C) numpy
@@ -289,10 +294,13 @@ def main():
                     if img_np.dtype == np.float32 or img_np.dtype == np.float64:
                         img_np = np.clip(img_np, 0, 1)
 
+                    # Ensure contiguous memory layout for Rerun
+                    img_np = np.ascontiguousarray(img_np)
+
                     clean_key = key.replace("observation.images.", "")
                     # Log to current global step
                     rr.set_time_sequence("step", global_step)
-                    rr.log(f"cameras/{clean_key}", rr.Image(img_np))
+                    rr.log(f"simulation_cameras/{clean_key}", rr.Image(img_np))
 
             # Prepare batch
             batch = {}
