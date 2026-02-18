@@ -67,13 +67,20 @@ class PiperMotorsBus:
         gripper_ctrl = gripper_msg.gripper_ctrl
 
         return {
-            "joint_1": joint_ctrl.joint_1 / self.joint_factor,
-            "joint_2": joint_ctrl.joint_2 / self.joint_factor,
-            "joint_3": joint_ctrl.joint_3 / self.joint_factor,
-            "joint_4": joint_ctrl.joint_4 / self.joint_factor,
-            "joint_5": joint_ctrl.joint_5 / self.joint_factor,
-            "joint_6": joint_ctrl.joint_6 / self.joint_factor,
-            "gripper": gripper_ctrl.grippers_angle / 1_000_000.0,
+            "joint_1_pos": joint_ctrl.joint_1 / self.joint_factor,
+            "joint_2_pos": joint_ctrl.joint_2 / self.joint_factor,
+            "joint_3_pos": joint_ctrl.joint_3 / self.joint_factor,
+            "joint_4_pos": joint_ctrl.joint_4 / self.joint_factor,
+            "joint_5_pos": joint_ctrl.joint_5 / self.joint_factor,
+            "joint_6_pos": joint_ctrl.joint_6 / self.joint_factor,
+            "gripper_pos": gripper_ctrl.grippers_angle / 1_000_000.0,
+            "joint_1_effort": 0.0,
+            "joint_2_effort": 0.0,
+            "joint_3_effort": 0.0,
+            "joint_4_effort": 0.0,
+            "joint_5_effort": 0.0,
+            "joint_6_effort": 0.0,
+            "gripper_effort": 0.0,
         }
 
     def disconnect(self) -> None:
