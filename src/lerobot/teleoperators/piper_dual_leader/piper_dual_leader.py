@@ -134,11 +134,15 @@ class PIPERDualLeader(Teleoperator):
 
         # Read left Master control commands via motor bus
         left_state = self.left_bus.read()
-        action = {f"left_{k}.pos": v for k, v in left_state.items()}
+        action = {}
+        for motor in self.MOTOR_DEFINITIONS:
+            # We only care about position for action
+            action[f"left_{motor}.pos"] = left_state[f"{motor}_pos"]
 
         # Read right Master control commands via motor bus
         right_state = self.right_bus.read()
-        action.update({f"right_{k}.pos": v for k, v in right_state.items()})
+        for motor in self.MOTOR_DEFINITIONS:
+            action[f"right_{motor}.pos"] = right_state[f"{motor}_pos"]
 
         dt_ms = (time.perf_counter() - start) * 1e3
         logger.debug(f"{self} read action: {dt_ms:.1f}ms")

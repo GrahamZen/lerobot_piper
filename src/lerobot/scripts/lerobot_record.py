@@ -63,6 +63,7 @@ lerobot-record \
 """
 
 import contextlib
+import json
 import logging
 import queue
 import threading
@@ -199,6 +200,7 @@ def init_tk_window(events, msg_queue):
             video_frame_container.grid_columnconfigure(2, weight=1)
             video_frame_container.grid_rowconfigure(0, weight=1)  # Cameras
             video_frame_container.grid_rowconfigure(1, weight=1)  # Plot
+            video_frame_container.grid_propagate(False)  # Prevent child widgets from resizing this frame
 
             # Cameras on Row 0: Left, Middle, Right
             camera_cells = {}
@@ -208,6 +210,7 @@ def init_tk_window(events, msg_queue):
             for cam_name, col_idx in camera_layout:
                 cell_frame = tk.Frame(video_frame_container, bd=1, relief="solid")
                 cell_frame.grid(row=0, column=col_idx, sticky="nsew", padx=2, pady=2)
+                cell_frame.pack_propagate(False)  # Prevent image from resizing the frame
 
                 lbl_title = tk.Label(cell_frame, text=f"Camera: {cam_name}", font=("Arial", 10, "bold"))
                 lbl_title.pack(side="top")
@@ -222,6 +225,7 @@ def init_tk_window(events, msg_queue):
             # Joint plot on Row 1, spanning all 3 columns
             plot_frame = tk.Frame(video_frame_container, bd=1, relief="solid")
             plot_frame.grid(row=1, column=0, columnspan=3, sticky="nsew", padx=2, pady=2)
+            plot_frame.pack_propagate(False)  # Prevent plot from resizing the frame
 
             lbl_plot_title = tk.Label(plot_frame, text="Joint Values", font=("Arial", 10, "bold"))
             lbl_plot_title.pack(side="top")
@@ -736,6 +740,18 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 batch_encoding_size=cfg.dataset.video_encoding_batch_size,
                 vcodec=cfg.dataset.vcodec,
             )
+
+        # Save the full configuration to the dataset directory
+        if dataset is not None and dataset.root is not None:
+            try:
+                meta_dir = Path(dataset.root) / "meta"
+                meta_dir.mkdir(parents=True, exist_ok=True)
+                config_path = meta_dir / "record_config.json"
+                with open(config_path, "w") as f:
+                    json.dump(asdict(cfg), f, indent=4, default=str)
+                logging.info(f"Saved recording config to {config_path}")
+            except Exception as e:
+                logging.warning(f"Failed to save recording config: {e}")
 
         # Load pretrained policy
         policy = None if cfg.policy is None else make_policy(cfg.policy, ds_meta=dataset.meta)
