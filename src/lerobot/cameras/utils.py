@@ -47,6 +47,11 @@ def make_cameras_from_configs(camera_configs: dict[str, CameraConfig]) -> dict[s
 
             cameras[key] = ZMQCamera(cfg)
 
+        elif cfg.type == "virtual_depth":
+            from lerobot.cameras.realsense.camera_virtual_depth import VirtualDepthCamera
+
+            cameras[key] = VirtualDepthCamera(cfg, cameras=cameras)
+
         else:
             try:
                 cameras[key] = cast(Camera, make_device_from_device_class(cfg))

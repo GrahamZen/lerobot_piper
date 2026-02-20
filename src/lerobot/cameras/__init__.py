@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from lerobot.cameras.realsense.configuration_virtual_depth import VirtualDepthCameraConfig
+
 from .camera import Camera
 from .configs import CameraConfig, ColorMode, Cv2Backends, Cv2Rotation
 from .utils import make_cameras_from_configs
+
+CameraConfig.register_subclass("virtual_depth", VirtualDepthCameraConfig)
