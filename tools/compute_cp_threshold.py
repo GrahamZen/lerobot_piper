@@ -129,22 +129,25 @@ def main() -> None:
     calibration_scores = load_temporal_disagreement(metrics_path)
     cp_threshold, q_level, n = compute_cp_threshold(calibration_scores, args.alpha)
 
+    print(f"repo_id: {args.repo_id}")
+    print(f"samples (n): {n}")
+    print(f"alpha: {args.alpha}")
+    print(f"q_level: {q_level}")
+    print(f"cp_threshold: {cp_threshold}")
+    if not record_config_path.exists():
+        print(
+            f"❌ record_config.json not found at {record_config_path}. Cannot write CP threshold without it."
+        )
+        return
     record_config = read_record_config(record_config_path)
     pretrained_path = resolve_pretrained_path(record_config)
     failure_handling_path = pretrained_path / "failure_handling.json"
-
     write_cp_threshold(
         failure_handling_path=failure_handling_path,
         cp_threshold=cp_threshold,
         record_config_path=record_config_path,
         pretrained_path=pretrained_path,
     )
-
-    print(f"repo_id: {args.repo_id}")
-    print(f"samples (n): {n}")
-    print(f"alpha: {args.alpha}")
-    print(f"q_level: {q_level}")
-    print(f"cp_threshold: {cp_threshold}")
     print(f"written_to: {failure_handling_path}")
 
 
