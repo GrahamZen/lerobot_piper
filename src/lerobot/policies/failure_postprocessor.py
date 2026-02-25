@@ -69,6 +69,7 @@ class FailurePostprocessor:
             self._enable_logging = bool(self._failure_handling_cfg["enable_logging"])
         else:
             self._enable_logging = bool(enable_logging)
+        self._enable_failure_handling = bool(self._failure_handling_cfg["enable_failure_handling"])
         self._failure_threshold = float(self._failure_handling_cfg["failure_threshold"])
 
         checkpoint_queue_size = max(1, int(self._failure_handling_cfg["checkpoint_queue_size"]))
@@ -121,6 +122,7 @@ class FailurePostprocessor:
     def _load_failure_handling_config(self, failure_handling_json_path: str | Path | None) -> dict:
         cfg = {
             "enable_logging": True,
+            "enable_failure_handling": True,
             "failure_threshold": 0.3,
             "checkpoint_queue_size": 5,
             "window_size": 31,
@@ -350,7 +352,7 @@ class FailurePostprocessor:
         is_failure = self._detect_failure(batch, intended_action)
         self._process_step += 1
 
-        if is_failure:
+        if is_failure and self._enable_failure_handling:
             return self._get_recovery_action(batch, intended_action)
 
         return intended_action
