@@ -23,6 +23,7 @@ import numpy as np
 import rerun as rr
 import rerun.blueprint as rrb
 from PIL import Image
+from scipy.ndimage import gaussian_filter1d
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
@@ -39,6 +40,64 @@ CHECKPOINT_SIGNAL_CONFIG = {
 }
 
 
+def load_checkpoint_signal_config_from_dataset(dataset_root):
+    record_config_path = Path(dataset_root) / "meta" / "record_config.json"
+    if not record_config_path.exists():
+        return {}
+
+    try:
+        with open(record_config_path) as f:
+            record_config = json.load(f)
+    except Exception as e:
+        print(f"Warning: Failed to parse record config at {record_config_path}: {e}")
+        return {}
+
+    pretrained_path = record_config.get("pretrained_path")
+    if not pretrained_path and isinstance(record_config.get("policy"), dict):
+        pretrained_path = record_config["policy"].get("pretrained_path")
+
+    if not pretrained_path:
+        for key in ("model", "train", "training"):
+            section = record_config.get(key)
+            if isinstance(section, dict) and section.get("pretrained_path"):
+                pretrained_path = section["pretrained_path"]
+                break
+
+    if not pretrained_path:
+        print(f"Warning: 'pretrained_path' not found in {record_config_path}")
+        return {}
+
+    pretrained_path = Path(pretrained_path).expanduser()
+    failure_handling_json_path = pretrained_path / "failure_handling.json"
+    if not failure_handling_json_path.exists():
+        nested_candidate = pretrained_path / "pretrained_model" / "failure_handling.json"
+        if nested_candidate.exists():
+            failure_handling_json_path = nested_candidate
+        else:
+            print(
+                "Warning: failure handling config not found. Tried "
+                f"{failure_handling_json_path} and {nested_candidate}"
+            )
+            return {}
+
+    try:
+        with open(failure_handling_json_path) as f:
+            failure_handling = json.load(f)
+    except Exception as e:
+        print(f"Warning: Failed to parse failure handling config at {failure_handling_json_path}: {e}")
+        return {}
+
+    loaded_cfg = {}
+    for key in CHECKPOINT_SIGNAL_CONFIG:
+        if key in failure_handling:
+            loaded_cfg[key] = failure_handling[key]
+
+    if loaded_cfg:
+        print(f"Loaded checkpoint signal config from {failure_handling_json_path}")
+
+    return loaded_cfg
+
+
 def build_checkpoint_series(
     failure_metrics,
     window_size=31,
@@ -50,8 +109,6 @@ def build_checkpoint_series(
 ):
     if not failure_metrics:
         return {}, {}, {}
-
-    from scipy.ndimage import gaussian_filter1d
 
     steps = np.array(sorted(failure_metrics.keys()), dtype=np.int64)
 
@@ -281,7 +338,11 @@ def visualize_dataset(repo_id, root=None, stride=7, checkpoint_signal_config=Non
     smoothed_td_by_step = {}
     previous_checkpoint_by_step = {}
     checkpoint_flag_by_step = {}
+
+    dataset_signal_cfg = load_checkpoint_signal_config_from_dataset(dataset.root)
     signal_cfg = dict(CHECKPOINT_SIGNAL_CONFIG)
+    if dataset_signal_cfg:
+        signal_cfg.update(dataset_signal_cfg)
     if checkpoint_signal_config:
         signal_cfg.update(checkpoint_signal_config)
 
