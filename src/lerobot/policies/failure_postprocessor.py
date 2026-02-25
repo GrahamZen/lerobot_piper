@@ -71,6 +71,14 @@ class FailurePostprocessor:
             self._enable_logging = bool(enable_logging)
         self._enable_failure_handling = bool(self._failure_handling_cfg["enable_failure_handling"])
         self._failure_threshold = float(self._failure_handling_cfg["failure_threshold"])
+        cp_threshold_raw = self._failure_handling_cfg.get("cp_threshold", self._failure_threshold)
+        try:
+            self._cp_threshold = float(cp_threshold_raw)
+        except (TypeError, ValueError):
+            logger.warning(
+                f"Invalid cp_threshold={cp_threshold_raw}; fallback to failure_threshold={self._failure_threshold}"
+            )
+            self._cp_threshold = self._failure_threshold
 
         checkpoint_queue_size = max(1, int(self._failure_handling_cfg["checkpoint_queue_size"]))
 
@@ -124,6 +132,7 @@ class FailurePostprocessor:
             "enable_logging": True,
             "enable_failure_handling": True,
             "failure_threshold": 0.3,
+            "cp_threshold": 0.3,
             "checkpoint_queue_size": 5,
             "window_size": 31,
             "eval_delay": 15,
@@ -411,7 +420,7 @@ class FailurePostprocessor:
         batch: dict[str, torch.Tensor],
         intended_action: torch.Tensor,
     ) -> bool:
-        return self._latest_temporal_disagreement > self._failure_threshold
+        return self._latest_temporal_disagreement > self._cp_threshold
 
     def _get_recovery_action(
         self,

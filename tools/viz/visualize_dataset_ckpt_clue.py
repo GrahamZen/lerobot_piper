@@ -43,6 +43,9 @@ CHECKPOINT_SIGNAL_CONFIG = {
 def load_checkpoint_signal_config_from_dataset(dataset_root):
     record_config_path = Path(dataset_root) / "meta" / "record_config.json"
     if not record_config_path.exists():
+        print(
+            f"Warning: record_config.json not found at {record_config_path}. Cannot load checkpoint signal config."
+        )
         return {}
 
     try:
@@ -87,15 +90,36 @@ def load_checkpoint_signal_config_from_dataset(dataset_root):
         print(f"Warning: Failed to parse failure handling config at {failure_handling_json_path}: {e}")
         return {}
 
-    loaded_cfg = {}
-    for key in CHECKPOINT_SIGNAL_CONFIG:
-        if key in failure_handling:
-            loaded_cfg[key] = failure_handling[key]
+    print(f"Loaded failure handling config from {failure_handling_json_path}")
+    return failure_handling
 
-    if loaded_cfg:
-        print(f"Loaded checkpoint signal config from {failure_handling_json_path}")
 
-    return loaded_cfg
+def build_failed_points_table_markdown(
+    failed_steps, failure_metrics, previous_checkpoint_by_step, cp_threshold
+):
+    title = "# Failed Points Summary"
+    threshold_line = (
+        f"\n\n- `cp_threshold`: `{cp_threshold:.6f}`"
+        if cp_threshold is not None
+        else "\n\n- `cp_threshold`: `N/A`"
+    )
+
+    table_header = (
+        "\n\n| # | failed_step (x) | temporal_disagreement (y_td) | previous_checkpoint_step (y_cp) |\n"
+        "| :--- | :--- | :--- | :--- |"
+    )
+
+    if not failed_steps:
+        return f"{title}{threshold_line}{table_header}\n| - | - | - | - |"
+
+    rows = []
+    for idx, step in enumerate(failed_steps, start=1):
+        td = float(failure_metrics.get(step, {}).get("temporal_disagreement", 0.0))
+        prev_cp = previous_checkpoint_by_step.get(step, np.nan)
+        prev_cp_text = "-" if (isinstance(prev_cp, float) and np.isnan(prev_cp)) else f"{float(prev_cp):.0f}"
+        rows.append(f"| {idx} | {int(step)} | {td:.6f} | {prev_cp_text} |")
+
+    return f"{title}{threshold_line}{table_header}\n" + "\n".join(rows)
 
 
 def build_checkpoint_series(
@@ -338,13 +362,42 @@ def visualize_dataset(repo_id, root=None, stride=7, checkpoint_signal_config=Non
     smoothed_td_by_step = {}
     previous_checkpoint_by_step = {}
     checkpoint_flag_by_step = {}
+    failed_steps = []
+    failed_step_set = set()
+    cp_threshold = None
 
-    dataset_signal_cfg = load_checkpoint_signal_config_from_dataset(dataset.root)
+    failure_handling_cfg = load_checkpoint_signal_config_from_dataset(dataset.root)
+    dataset_signal_cfg = {
+        key: failure_handling_cfg[key] for key in CHECKPOINT_SIGNAL_CONFIG if key in failure_handling_cfg
+    }
+    if "cp_threshold" in failure_handling_cfg:
+        try:
+            cp_threshold = float(failure_handling_cfg["cp_threshold"])
+            print(f"Loaded cp_threshold from failure_handling.json: {cp_threshold:.6f}")
+        except (TypeError, ValueError):
+            print(
+                "Warning: cp_threshold exists in failure_handling config but is not a valid float. "
+                f"Got: {failure_handling_cfg['cp_threshold']}"
+            )
+
     signal_cfg = dict(CHECKPOINT_SIGNAL_CONFIG)
     if dataset_signal_cfg:
         signal_cfg.update(dataset_signal_cfg)
     if checkpoint_signal_config:
         signal_cfg.update(checkpoint_signal_config)
+
+    effective_cfg_dump = {
+        "window_size": signal_cfg["window_size"],
+        "eval_delay": signal_cfg["eval_delay"],
+        "valley_lookback": signal_cfg["valley_lookback"],
+        "valley_lookahead": signal_cfg["valley_lookahead"],
+        "smoothing_sigma": signal_cfg["smoothing_sigma"],
+        "valley_prominence": signal_cfg["valley_prominence"],
+        "cp_threshold": cp_threshold,
+        "is_failing_rule": "temporal_disagreement > cp_threshold",
+    }
+    print("[Config Dump] Effective in-use config:")
+    print(json.dumps(effective_cfg_dump, indent=2, ensure_ascii=False, sort_keys=True))
 
     if failure_metrics:
         smoothed_td_by_step, previous_checkpoint_by_step, checkpoint_flag_by_step = build_checkpoint_series(
@@ -362,6 +415,20 @@ def visualize_dataset(repo_id, root=None, stride=7, checkpoint_signal_config=Non
             f"(window_size={signal_cfg['window_size']}, lookback={signal_cfg['valley_lookback']}, "
             f"lookahead={signal_cfg['valley_lookahead']}, prominence={signal_cfg['valley_prominence']})."
         )
+
+        if cp_threshold is not None:
+            failed_steps = [
+                step
+                for step in sorted(failure_metrics.keys())
+                if float(failure_metrics[step].get("temporal_disagreement", 0.0)) > cp_threshold
+            ]
+            failed_step_set = set(failed_steps)
+            print(
+                f"Detected {len(failed_steps)} failing points from is_failing rule "
+                f"(temporal_disagreement > cp_threshold={cp_threshold:.6f})."
+            )
+        else:
+            print("Warning: cp_threshold not found. Failed-point markers and table will be empty.")
 
     print("Initializing Rerun...")
 
@@ -386,39 +453,43 @@ def visualize_dataset(repo_id, root=None, stride=7, checkpoint_signal_config=Non
                     column_shares=[2, 1],
                 ),
                 # === Modified part: 3x2 layout for metrics ===
-                rrb.Vertical(
-                    rrb.Horizontal(
-                        rrb.TimeSeriesView(
-                            name="Temporal Disagreement", origin="metrics/temporal_disagreement"
+                rrb.Horizontal(
+                    rrb.Vertical(
+                        rrb.Horizontal(
+                            rrb.TimeSeriesView(
+                                name="Temporal Disagreement", origin="metrics/temporal_disagreement"
+                            ),
+                            rrb.TimeSeriesView(
+                                name="Smoothed Temporal Disagreement",
+                                origin="metrics/temporal_disagreement_smoothed",
+                            ),
                         ),
-                        rrb.TimeSeriesView(
-                            name="Smoothed Temporal Disagreement",
-                            origin="metrics/temporal_disagreement_smoothed",
+                        rrb.Horizontal(
+                            rrb.TimeSeriesView(name="Following Error", origin="metrics/following_error"),
+                            rrb.TimeSeriesView(
+                                name="Previous Checkpoint Step", origin="metrics/previous_checkpoint_step"
+                            ),
+                        ),
+                        rrb.Horizontal(
+                            rrb.TimeSeriesView(name="Attention Entropy", origin="metrics/attention_entropy"),
+                            rrb.TimeSeriesView(
+                                name="Mahalanobis Distance", origin="metrics/mahalanobis_distance"
+                            ),
+                        ),
+                        rrb.Horizontal(
+                            rrb.TimeSeriesView(name="Endpoint Shift", origin="metrics/endpoint_shift"),
+                            rrb.TimeSeriesView(name="Action Jerk", origin="metrics/action_jerk"),
+                        ),
+                        rrb.Horizontal(
+                            rrb.TimeSeriesView(
+                                name="Attention Entropy Downward Slope",
+                                origin="metrics/attention_entropy_downward_slope",
+                            ),
+                            rrb.TimeSeriesView(name="Checkpoint Flag", origin="metrics/checkpoint_flag"),
                         ),
                     ),
-                    rrb.Horizontal(
-                        rrb.TimeSeriesView(name="Following Error", origin="metrics/following_error"),
-                        rrb.TimeSeriesView(
-                            name="Previous Checkpoint Step", origin="metrics/previous_checkpoint_step"
-                        ),
-                    ),
-                    rrb.Horizontal(
-                        rrb.TimeSeriesView(name="Attention Entropy", origin="metrics/attention_entropy"),
-                        rrb.TimeSeriesView(
-                            name="Mahalanobis Distance", origin="metrics/mahalanobis_distance"
-                        ),
-                    ),
-                    rrb.Horizontal(
-                        rrb.TimeSeriesView(name="Endpoint Shift", origin="metrics/endpoint_shift"),
-                        rrb.TimeSeriesView(name="Action Jerk", origin="metrics/action_jerk"),
-                    ),
-                    rrb.Horizontal(
-                        rrb.TimeSeriesView(
-                            name="Attention Entropy Downward Slope",
-                            origin="metrics/attention_entropy_downward_slope",
-                        ),
-                        rrb.TimeSeriesView(name="Checkpoint Flag", origin="metrics/checkpoint_flag"),
-                    ),
+                    rrb.TextDocumentView(origin="summary/failed_points_table", name="Failed Points Table"),
+                    column_shares=[3, 1],
                 ),
                 row_shares=[3, 3],
             ),
@@ -430,6 +501,29 @@ def visualize_dataset(repo_id, root=None, stride=7, checkpoint_signal_config=Non
     rr.init("LeRobot Dataset Visualizer", spawn=True)
     if blueprint:
         rr.send_blueprint(blueprint)
+
+    if failure_metrics:
+        rr.log(
+            "metrics/temporal_disagreement/failed_markers",
+            rr.SeriesPoints(colors=[255, 0, 0], markers="circle", marker_sizes=6.0),
+            static=True,
+        )
+        rr.log(
+            "metrics/previous_checkpoint_step/failed_markers",
+            rr.SeriesPoints(colors=[255, 0, 0], markers="circle", marker_sizes=6.0),
+            static=True,
+        )
+        failed_table_md = build_failed_points_table_markdown(
+            failed_steps,
+            failure_metrics,
+            previous_checkpoint_by_step,
+            cp_threshold,
+        )
+        rr.log(
+            "summary/failed_points_table",
+            rr.TextDocument(failed_table_md, media_type=rr.MediaType.MARKDOWN),
+            static=True,
+        )
 
     fk = PiperFK()
     print("Logging initial meshes...")
@@ -555,7 +649,7 @@ def visualize_dataset(repo_id, root=None, stride=7, checkpoint_signal_config=Non
             if failure_metrics:
                 m = failure_metrics.get(i, {})
                 raw_temporal_disagreement = float(m.get("temporal_disagreement", 0.0))
-                rr.log("metrics/temporal_disagreement", rr.Scalars(raw_temporal_disagreement))
+                rr.log("metrics/temporal_disagreement/value", rr.Scalars(raw_temporal_disagreement))
                 rr.log(
                     "metrics/temporal_disagreement_smoothed",
                     rr.Scalars(smoothed_td_by_step.get(i, raw_temporal_disagreement)),
@@ -581,10 +675,20 @@ def visualize_dataset(repo_id, root=None, stride=7, checkpoint_signal_config=Non
                 rr.log("metrics/endpoint_shift", rr.Scalars(m.get("endpoint_shift", 0.0)))
                 rr.log("metrics/action_jerk", rr.Scalars(m.get("action_jerk", 0.0)))
                 rr.log(
-                    "metrics/previous_checkpoint_step",
+                    "metrics/previous_checkpoint_step/value",
                     rr.Scalars(previous_checkpoint_by_step.get(i, np.nan)),
                 )
                 rr.log("metrics/checkpoint_flag", rr.Scalars(checkpoint_flag_by_step.get(i, 0.0)))
+
+                if i in failed_step_set:
+                    rr.log(
+                        "metrics/temporal_disagreement/failed_markers",
+                        rr.Scalars(raw_temporal_disagreement),
+                    )
+                    rr.log(
+                        "metrics/previous_checkpoint_step/failed_markers",
+                        rr.Scalars(previous_checkpoint_by_step.get(i, np.nan)),
+                    )
 
     print("\nDone streaming to Rerun.")
 
