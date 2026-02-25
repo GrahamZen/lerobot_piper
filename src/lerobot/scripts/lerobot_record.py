@@ -775,6 +775,16 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 },
             )
 
+            # Initialize failure detection monitoring for ACT policies
+            if hasattr(policy, "init_failure_postprocessor"):
+                failure_handling_json_path = None
+                if cfg.policy.pretrained_path:
+                    failure_handling_json_path = Path(cfg.policy.pretrained_path) / "failure_handling.json"
+                policy.init_failure_postprocessor(
+                    output_dir=dataset.root,
+                    failure_handling_json_path=failure_handling_json_path,
+                )
+
         robot.connect()
         if teleop is not None:
             teleop.connect()
