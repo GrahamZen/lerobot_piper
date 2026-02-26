@@ -205,6 +205,9 @@ class FailurePostprocessor:
         Metric 1: Temporal Ensembling Disagreement.
         MSE between the old ensembled plan and the new prediction's overlapping portion.
         """
+        if self._process_step == 0:
+            return 0.0
+
         if not hasattr(self.policy, "temporal_ensembler"):
             return 0.0
 
@@ -216,6 +219,10 @@ class FailurePostprocessor:
         old_plan = ensembler.ensembled_actions
         # new_actions_chunk: (B, chunk_size, action_dim) — take the first chunk_size-1
         overlap_len = old_plan.shape[1]
+
+        if overlap_len == 0 or new_actions_chunk.shape[1] < overlap_len:
+            return 0.0
+
         new_plan = new_actions_chunk[:, :overlap_len]
 
         mse = F.mse_loss(old_plan, new_plan)
