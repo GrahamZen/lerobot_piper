@@ -22,7 +22,8 @@ import torch
 import torch.nn.functional as F  # noqa: N812
 from scipy.ndimage import gaussian_filter1d
 
-from lerobot.utils.constants import OBS_IMAGE, OBS_IMAGES, OBS_STATE
+from lerobot.policies.vlm_service import VLMService
+from lerobot.utils.constants import OBS_STATE
 
 logger = logging.getLogger(__name__)
 
@@ -113,10 +114,9 @@ class FailurePostprocessor:
         self._recent_disagreements = deque(maxlen=self._window_size)
         self._recent_actions = deque(maxlen=self._window_size)
         self._recent_steps = deque(maxlen=self._window_size)
-        self._recent_images = deque(maxlen=self._window_size)
         self._checkpoint_action_queue: deque[tuple[int, torch.Tensor]] = deque(maxlen=checkpoint_queue_size)
         self._checkpoint_step_set: set[int] = set()
-        self._checkpoint_images: dict[int, dict[str, torch.Tensor]] = {}
+        self._vlm_service = VLMService()
 
         # Register hooks only when full diagnostics logging is enabled.
         if self._enable_logging:
@@ -350,7 +350,6 @@ class FailurePostprocessor:
         if new_actions_chunk is not None:
             actual_qpos = batch.get(OBS_STATE)
             target_qpos = new_actions_chunk[:, 0] if new_actions_chunk.dim() == 3 else new_actions_chunk
-            self._recent_images.append(self._extract_camera_images(batch))
             self._recent_steps.append(self._process_step)
             self._recent_actions.append(intended_action.detach().clone())
             self._latest_temporal_disagreement = self.get_temporal_disagreement(new_actions_chunk)
@@ -413,7 +412,6 @@ class FailurePostprocessor:
             return
 
         checkpoint_action = self._recent_actions[eval_idx]
-        checkpoint_images = self._recent_images[eval_idx]
 
         if len(self._checkpoint_action_queue) == self._checkpoint_action_queue.maxlen:
             oldest_step, _ = self._checkpoint_action_queue[0]
@@ -421,8 +419,6 @@ class FailurePostprocessor:
 
         self._checkpoint_action_queue.append((checkpoint_step, checkpoint_action.detach().clone()))
         self._checkpoint_step_set.add(checkpoint_step)
-        if checkpoint_images:
-            self._checkpoint_images[checkpoint_step] = checkpoint_images
 
         logger.debug(f"Registered new safe Checkpoint at step {checkpoint_step}")
 
@@ -438,28 +434,22 @@ class FailurePostprocessor:
         batch: dict[str, torch.Tensor],
         intended_action: torch.Tensor,
     ) -> torch.Tensor:
-        if self._checkpoint_action_queue:
-            _, checkpoint_action = self._checkpoint_action_queue[0]
-            return checkpoint_action.to(intended_action.device)
-        return intended_action
+        if not self._checkpoint_action_queue:
+            return intended_action
 
-    def _extract_camera_images(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        images: dict[str, torch.Tensor] = {}
-        if OBS_IMAGE in batch:
-            images["image"] = self._clone_to_cpu(batch[OBS_IMAGE])
+        checkpoint_indices = list(range(len(self._checkpoint_action_queue)))
+        selected_index = self._vlm_service.select_checkpoint_index(
+            batch=batch,
+            checkpoint_indices=checkpoint_indices,
+            episode=self._episode,
+            step=self._process_step,
+        )
 
-        prefix = f"{OBS_IMAGES}."
-        for key, value in batch.items():
-            if key.startswith(prefix):
-                view_name = key[len(prefix) :]
-                images[view_name] = self._clone_to_cpu(value)
+        if selected_index is None or not (0 <= selected_index < len(self._checkpoint_action_queue)):
+            selected_index = 0
 
-        return images
-
-    def _clone_to_cpu(self, value: torch.Tensor) -> torch.Tensor:
-        if torch.is_tensor(value):
-            return value.detach().cpu().clone()
-        return torch.as_tensor(value).detach().cpu().clone()
+        _, checkpoint_action = self._checkpoint_action_queue[selected_index]
+        return checkpoint_action.to(intended_action.device)
 
     def compute_and_log(self, actions_chunk, target_qpos=None, actual_qpos=None, temporal_disagreement=None):
         """
@@ -566,10 +556,8 @@ class FailurePostprocessor:
         self._recent_disagreements.clear()
         self._recent_actions.clear()
         self._recent_steps.clear()
-        self._recent_images.clear()
         self._checkpoint_action_queue.clear()
         self._checkpoint_step_set.clear()
-        self._checkpoint_images.clear()
 
     def close(self):
         """Clean up hooks, flush features, and close file handle."""
