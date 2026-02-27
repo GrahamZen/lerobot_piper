@@ -59,7 +59,7 @@ class MetricsConfig:
 class FailureConfig:
     enable_logging: bool = True
     enable_failure_handling: bool = False
-    flush_metrics_every_step: bool = True
+    flush_metrics_every_step: bool = False
     checkpoint_queue_size: int = 5
 
     metrics: MetricsConfig = field(default_factory=MetricsConfig)
@@ -79,7 +79,7 @@ class FailureConfig:
             return cls()
 
         try:
-            cfg = draccus.parse(cls, config_path=cfg_path)
+            cfg = draccus.parse(cls, config_path=cfg_path, args=[])
             logger.info(f"Loaded failure handling config from {cfg_path}")
             return cfg
         except Exception as exc:

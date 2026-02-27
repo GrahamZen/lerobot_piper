@@ -315,7 +315,8 @@ class FailureMetrics:
                     if torch.is_tensor(v):
                         metrics[k] = v.item()
                 f.write(json.dumps(metrics) + "\n")
-        logger.info(f"Saved {len(self.metrics_buffer)} metric rows to {fpath}")
+        if len(self.metrics_buffer) > 1:
+            logger.info(f"Saved {len(self.metrics_buffer)} metric rows to {fpath}")
         self.metrics_buffer.clear()
 
     def flush_features(self):
@@ -337,13 +338,17 @@ class FailureMetrics:
 
         combined = existing + self.feature_buffer
         torch.save(combined, fpath)
-        logger.info(f"Saved {len(self.feature_buffer)} feature vectors to {fpath} (total: {len(combined)})")
+        if len(self.feature_buffer) > 1:
+            logger.info(
+                f"Saved {len(self.feature_buffer)} feature vectors to {fpath} (total: {len(combined)})"
+            )
         self.feature_buffer.clear()
 
     def finalize(self):
-        logger.info(
-            f"Flushing {len(self.metrics_buffer)} metric rows and {len(self.feature_buffer)} feature vectors"
-        )
+        if len(self.metrics_buffer) > 0 or len(self.feature_buffer) > 0:
+            logger.info(
+                f"Flushing {len(self.metrics_buffer)} metric rows and {len(self.feature_buffer)} feature vectors"
+            )
         self.flush_metrics()
         self.flush_features()
 
