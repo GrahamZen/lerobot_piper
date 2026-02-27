@@ -22,7 +22,7 @@ import torch
 import torch.nn.functional as F  # noqa: N812
 from scipy.ndimage import gaussian_filter1d
 
-from lerobot.utils.constants import OBS_STATE
+from lerobot.utils.constants import OBS_IMAGE, OBS_IMAGES, OBS_STATE
 
 logger = logging.getLogger(__name__)
 
@@ -101,8 +101,8 @@ class FailurePostprocessor:
         # Bookkeeping
         self._step = 0
         self._episode = 0
-        self._file_handle = None
         self._hooks = []
+        self._metrics_buffer = []
 
         # Buffer for backbone features (saved for offline Mahalanobis distance)
         self._feature_buffer = []
@@ -113,19 +113,19 @@ class FailurePostprocessor:
         self._recent_disagreements = deque(maxlen=self._window_size)
         self._recent_actions = deque(maxlen=self._window_size)
         self._recent_steps = deque(maxlen=self._window_size)
+        self._recent_images = deque(maxlen=self._window_size)
         self._checkpoint_action_queue: deque[tuple[int, torch.Tensor]] = deque(maxlen=checkpoint_queue_size)
         self._checkpoint_step_set: set[int] = set()
+        self._checkpoint_images: dict[int, dict[str, torch.Tensor]] = {}
 
         # Register hooks only when full diagnostics logging is enabled.
         if self._enable_logging:
             self._register_hooks()
 
-        # Open output file
         if self._enable_logging and self.output_dir is not None:
-            self.output_dir.mkdir(parents=True, exist_ok=True)
-            fpath = self.output_dir / "failure_metrics.jsonl"
-            self._file_handle = open(fpath, "a")  # noqa: SIM115
-            logger.info(f"FailurePostprocessor logging to {fpath}")
+            logger.info(
+                "FailurePostprocessor initialized (metrics/features buffered in memory until finalize)"
+            )
 
     def _load_failure_handling_config(self, failure_handling_json_path: str | Path | None) -> dict:
         cfg = {
@@ -350,6 +350,7 @@ class FailurePostprocessor:
         if new_actions_chunk is not None:
             actual_qpos = batch.get(OBS_STATE)
             target_qpos = new_actions_chunk[:, 0] if new_actions_chunk.dim() == 3 else new_actions_chunk
+            self._recent_images.append(self._extract_camera_images(batch))
             self._recent_steps.append(self._process_step)
             self._recent_actions.append(intended_action.detach().clone())
             self._latest_temporal_disagreement = self.get_temporal_disagreement(new_actions_chunk)
@@ -412,6 +413,7 @@ class FailurePostprocessor:
             return
 
         checkpoint_action = self._recent_actions[eval_idx]
+        checkpoint_images = self._recent_images[eval_idx]
 
         if len(self._checkpoint_action_queue) == self._checkpoint_action_queue.maxlen:
             oldest_step, _ = self._checkpoint_action_queue[0]
@@ -419,6 +421,8 @@ class FailurePostprocessor:
 
         self._checkpoint_action_queue.append((checkpoint_step, checkpoint_action.detach().clone()))
         self._checkpoint_step_set.add(checkpoint_step)
+        if checkpoint_images:
+            self._checkpoint_images[checkpoint_step] = checkpoint_images
 
         logger.debug(f"Registered new safe Checkpoint at step {checkpoint_step}")
 
@@ -438,6 +442,24 @@ class FailurePostprocessor:
             _, checkpoint_action = self._checkpoint_action_queue[0]
             return checkpoint_action.to(intended_action.device)
         return intended_action
+
+    def _extract_camera_images(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        images: dict[str, torch.Tensor] = {}
+        if OBS_IMAGE in batch:
+            images["image"] = self._clone_to_cpu(batch[OBS_IMAGE])
+
+        prefix = f"{OBS_IMAGES}."
+        for key, value in batch.items():
+            if key.startswith(prefix):
+                view_name = key[len(prefix) :]
+                images[view_name] = self._clone_to_cpu(value)
+
+        return images
+
+    def _clone_to_cpu(self, value: torch.Tensor) -> torch.Tensor:
+        if torch.is_tensor(value):
+            return value.detach().cpu().clone()
+        return torch.as_tensor(value).detach().cpu().clone()
 
     def compute_and_log(self, actions_chunk, target_qpos=None, actual_qpos=None, temporal_disagreement=None):
         """
@@ -479,10 +501,8 @@ class FailurePostprocessor:
                 }
             )
 
-        # Write to file
-        if self._file_handle is not None:
-            self._file_handle.write(json.dumps(metrics) + "\n")
-            self._file_handle.flush()
+        if self.output_dir is not None:
+            self._metrics_buffer.append(metrics)
 
         # Clear per-step caches
         self._cam_features_this_step.clear()
@@ -495,10 +515,23 @@ class FailurePostprocessor:
     # Lifecycle
     # ------------------------------------------------------------------
 
+    def _flush_metrics(self):
+        """Save accumulated metrics to disk."""
+        if not self._metrics_buffer or self.output_dir is None:
+            return
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        fpath = self.output_dir / "failure_metrics.jsonl"
+        with open(fpath, "a") as f:
+            for metrics in self._metrics_buffer:
+                f.write(json.dumps(metrics) + "\n")
+        logger.info(f"Saved {len(self._metrics_buffer)} metric rows to {fpath}")
+        self._metrics_buffer.clear()
+
     def _flush_features(self):
         """Save accumulated backbone features to disk."""
         if not self._feature_buffer or self.output_dir is None:
             return
+        self.output_dir.mkdir(parents=True, exist_ok=True)
         fpath = self.output_dir / "backbone_features.pt"
         # Load existing data if present, then append
         existing = []
@@ -512,9 +545,18 @@ class FailurePostprocessor:
         logger.info(f"Saved {len(self._feature_buffer)} feature vectors to {fpath} (total: {len(combined)})")
         self._feature_buffer.clear()
 
+    def finalize_recording(self):
+        """Persist buffered metrics/features to disk after inference or episode end."""
+        self._flush_metrics()
+        self._flush_features()
+
+    def finalize(self):
+        """Backward-compatible alias for finalize_recording."""
+        self.finalize_recording()
+
     def reset(self):
         """Call at episode boundaries. Increments episode counter, keeps global step."""
-        self._flush_features()
+        self.finalize_recording()
         self._episode += 1
         self._process_step = 0
         self._cam_features_this_step.clear()
@@ -524,15 +566,14 @@ class FailurePostprocessor:
         self._recent_disagreements.clear()
         self._recent_actions.clear()
         self._recent_steps.clear()
+        self._recent_images.clear()
         self._checkpoint_action_queue.clear()
         self._checkpoint_step_set.clear()
+        self._checkpoint_images.clear()
 
     def close(self):
         """Clean up hooks, flush features, and close file handle."""
-        self._flush_features()
+        self.finalize_recording()
         for h in self._hooks:
             h.remove()
         self._hooks.clear()
-        if self._file_handle is not None:
-            self._file_handle.close()
-            self._file_handle = None

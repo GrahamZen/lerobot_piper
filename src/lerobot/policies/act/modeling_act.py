@@ -98,6 +98,10 @@ class ACTPolicy(PreTrainedPolicy):
             failure_handling_json_path=failure_handling_json_path,
         )
 
+    def finalize_recording(self):
+        if self._failure_postprocessor is not None:
+            self._failure_postprocessor.finalize_recording()
+
     def get_optim_params(self) -> dict:
         # TODO(aliberts, rcadene): As of now, lr_backbone == lr
         # Should we remove this and just `return self.parameters()`?

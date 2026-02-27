@@ -870,6 +870,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 recorded_episodes += 1
     finally:
         log_say("Stop recording", cfg.play_sounds, blocking=True)
+        if hasattr(policy, "finalize_recording") and callable(policy.finalize_recording):
+            policy.finalize_recording()
 
         if dataset:
             dataset.finalize()
