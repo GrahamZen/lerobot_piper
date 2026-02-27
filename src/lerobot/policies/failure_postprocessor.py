@@ -226,7 +226,7 @@ class FailurePostprocessor:
         new_plan = new_actions_chunk[:, :overlap_len]
 
         mse = F.mse_loss(old_plan, new_plan)
-        return mse.item()
+        return mse
 
     def get_following_error(self, target_qpos, actual_qpos):
         """
@@ -245,7 +245,7 @@ class FailurePostprocessor:
         actual = actual[:min_dim]
 
         error = torch.norm(target - actual, p=2)
-        return error.item()
+        return error
 
     def get_attention_entropy(self):
         """
@@ -258,7 +258,7 @@ class FailurePostprocessor:
         # attn_weights: (B, target_seq, source_seq)
         p = self._last_attn_weights + 1e-9
         entropy = -torch.sum(p * torch.log(p), dim=-1)  # (B, target_seq)
-        return entropy.mean().item()
+        return entropy.mean()
 
     def get_mahalanobis_distance(self):
         """
@@ -285,7 +285,7 @@ class FailurePostprocessor:
         diff = feat_vector - mu
         left = torch.matmul(diff, inv_cov)
         mahalanobis_sq = torch.matmul(left, diff)
-        return torch.sqrt(torch.abs(mahalanobis_sq)).item()
+        return torch.sqrt(torch.abs(mahalanobis_sq))
 
     def get_endpoint_shift(self, actions_chunk):
         """
@@ -313,7 +313,7 @@ class FailurePostprocessor:
         # Update cache with the new furthest point
         self._last_chunk_endpoint = current_plan[:, -1]
 
-        return shift.mean().item()
+        return shift.mean()
 
     def get_action_jerk(self, actions_chunk):
         """
@@ -328,7 +328,7 @@ class FailurePostprocessor:
         velocity = torch.diff(actions_chunk, dim=1)
         acceleration = torch.diff(velocity, dim=1)
         jerk = torch.diff(acceleration, dim=1)
-        return torch.norm(jerk, dim=-1).mean().item()
+        return torch.norm(jerk, dim=-1).mean()
 
     # ------------------------------------------------------------------
     # Main entry point (called from select_action)
@@ -350,10 +350,21 @@ class FailurePostprocessor:
         if new_actions_chunk is not None:
             actual_qpos = batch.get(OBS_STATE)
             target_qpos = new_actions_chunk[:, 0] if new_actions_chunk.dim() == 3 else new_actions_chunk
-            self._recent_steps.append(self._process_step)
-            self._recent_actions.append(intended_action.detach().clone())
+
             self._latest_temporal_disagreement = self.get_temporal_disagreement(new_actions_chunk)
-            self._recent_disagreements.append(self._latest_temporal_disagreement)
+
+            if self._enable_failure_handling:
+                self._recent_steps.append(self._process_step)
+                self._recent_actions.append(intended_action.detach().clone())
+                # Sync tensor to CPU for checkpoint queue if needed
+                val = self._latest_temporal_disagreement
+                if torch.is_tensor(val):
+                    val = val.item()
+                self._recent_disagreements.append(val)
+                min_required = self._eval_delay + self._valley_lookback + 1
+                if len(self._recent_disagreements) >= min_required:
+                    self._update_checkpoint_queue()
+
             if self._enable_logging:
                 self.compute_and_log(
                     actions_chunk=new_actions_chunk,
@@ -361,14 +372,14 @@ class FailurePostprocessor:
                     actual_qpos=actual_qpos,
                     temporal_disagreement=self._latest_temporal_disagreement,
                 )
-            min_required = self._eval_delay + self._valley_lookback + 1
-            if len(self._recent_disagreements) >= min_required:
-                self._update_checkpoint_queue()
 
-        is_failure = self._detect_failure(batch, intended_action)
+        is_failure = False
+        if self._enable_failure_handling:
+            is_failure = self._detect_failure(batch, intended_action)
+
         self._process_step += 1
 
-        if is_failure and self._enable_failure_handling:
+        if is_failure:
             return self._get_recovery_action(batch, intended_action)
 
         return intended_action
@@ -427,7 +438,10 @@ class FailurePostprocessor:
         batch: dict[str, torch.Tensor],
         intended_action: torch.Tensor,
     ) -> bool:
-        return self._latest_temporal_disagreement > self._cp_threshold
+        val = self._latest_temporal_disagreement
+        if torch.is_tensor(val):
+            val = val.item()
+        return val > self._cp_threshold
 
     def _get_recovery_action(
         self,
@@ -487,7 +501,7 @@ class FailurePostprocessor:
                 {
                     "episode": self._episode,
                     "step": self._step,
-                    "feature": feat_vector.cpu(),
+                    "feature": feat_vector,  # Keep on GPU to avoid blocking
                 }
             )
 
@@ -513,6 +527,10 @@ class FailurePostprocessor:
         fpath = self.output_dir / "failure_metrics.jsonl"
         with open(fpath, "a") as f:
             for metrics in self._metrics_buffer:
+                # Resolve lazily stored GPU tensors to Python floats
+                for k, v in metrics.items():
+                    if torch.is_tensor(v):
+                        metrics[k] = v.item()
                 f.write(json.dumps(metrics) + "\n")
         logger.info(f"Saved {len(self._metrics_buffer)} metric rows to {fpath}")
         self._metrics_buffer.clear()
@@ -530,6 +548,11 @@ class FailurePostprocessor:
                 existing = torch.load(fpath, weights_only=True)
             except Exception:
                 existing = []
+
+        for item in self._feature_buffer:
+            if torch.is_tensor(item["feature"]):
+                item["feature"] = item["feature"].cpu()
+
         combined = existing + self._feature_buffer
         torch.save(combined, fpath)
         logger.info(f"Saved {len(self._feature_buffer)} feature vectors to {fpath} (total: {len(combined)})")
