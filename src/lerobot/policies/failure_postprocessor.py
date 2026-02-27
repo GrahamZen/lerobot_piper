@@ -537,6 +537,9 @@ class FailurePostprocessor:
 
     def finalize_recording(self):
         """Persist buffered metrics/features to disk after inference or episode end."""
+        logger.info(
+            f"Flushing {len(self._metrics_buffer)} metric rows and {len(self._feature_buffer)} feature vectors"
+        )
         self._flush_metrics()
         self._flush_features()
 
