@@ -74,8 +74,6 @@ class ACTPolicy(PreTrainedPolicy):
     def init_failure_postprocessor(
         self,
         output_dir=None,
-        offline_mu=None,
-        offline_inv_cov=None,
         failure_handling_json_path=None,
     ):
         """Initialize failure detection monitoring.
@@ -85,22 +83,18 @@ class ACTPolicy(PreTrainedPolicy):
 
         Args:
             output_dir: Directory to write failure_metrics.jsonl (typically dataset.root).
-            offline_mu: (C,) tensor — training-set backbone feature mean (for Mahalanobis).
-            offline_inv_cov: (C, C) tensor — inverse covariance of training-set features.
             failure_handling_json_path: Path to failure_handling.json for runtime
                 failure handling parameters.
         """
         self._failure_postprocessor = FailurePostprocessor(
             policy=self,
             output_dir=output_dir,
-            offline_mu=offline_mu,
-            offline_inv_cov=offline_inv_cov,
             failure_handling_json_path=failure_handling_json_path,
         )
 
-    def finalize_recording(self):
+    def finalize(self):
         if self._failure_postprocessor is not None:
-            self._failure_postprocessor.finalize_recording()
+            self._failure_postprocessor.finalize()
 
     def get_optim_params(self) -> dict:
         # TODO(aliberts, rcadene): As of now, lr_backbone == lr
