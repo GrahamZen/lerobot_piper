@@ -64,6 +64,9 @@ class FailureMetrics:
         self.recent_actions: deque = deque(maxlen=td_cfg.window_size)
         self.recent_steps: deque = deque(maxlen=td_cfg.window_size)
 
+        fusion_cfg = self.config.metrics.fusion_mahalanobis
+        self.recent_entropies: deque = deque(maxlen=fusion_cfg.window_size)
+
         self.checkpoint_action_queue: deque[tuple[int, torch.Tensor]] = deque(
             maxlen=self.config.checkpoint_queue_size
         )
@@ -164,6 +167,22 @@ class FailureMetrics:
         jerk = torch.diff(acceleration, dim=1)
         return torch.norm(jerk, dim=-1).mean()
 
+    def get_fusion_mahalanobis(self, td: float, entropy: float) -> float:
+        self.recent_entropies.append(entropy)
+
+        variance = float(np.var(list(self.recent_entropies))) if len(self.recent_entropies) > 1 else 0.0
+
+        cfg = self.config.metrics.fusion_mahalanobis
+        mu = np.array(cfg.mu)
+        inv_cov = np.array(cfg.inv_cov)
+
+        feature = np.array([td, variance])
+        diff = feature - mu
+
+        left = np.dot(diff, inv_cov)
+        mahalanobis_sq = np.sum(left * diff)
+        return float(np.sqrt(np.abs(mahalanobis_sq)))
+
     # ------------------------------------------------------------------
     # State tracking and checkpoints
     # ------------------------------------------------------------------
@@ -253,18 +272,34 @@ class FailureMetrics:
             "timestamp": time.time(),
         }
 
-        if self.config.metrics.temporal_disagreement.enabled:
-            metrics["temporal_disagreement"] = (
+        td = None
+        if (
+            self.config.metrics.temporal_disagreement.enabled
+            or self.config.metrics.fusion_mahalanobis.enabled
+        ):
+            td = (
                 self.get_temporal_disagreement(actions_chunk)
                 if temporal_disagreement is None
                 else temporal_disagreement
             )
+            if torch.is_tensor(td):
+                td = td.item()
+            if self.config.metrics.temporal_disagreement.enabled:
+                metrics["temporal_disagreement"] = td
 
         if self.config.metrics.following_error.enabled:
             metrics["following_error"] = self.get_following_error(target_qpos, actual_qpos)
 
-        if self.config.metrics.attention_entropy.enabled:
-            metrics["attention_entropy"] = self.get_attention_entropy()
+        entropy = None
+        if self.config.metrics.attention_entropy.enabled or self.config.metrics.fusion_mahalanobis.enabled:
+            entropy = self.get_attention_entropy()
+            if torch.is_tensor(entropy):
+                entropy = entropy.item()
+            if self.config.metrics.attention_entropy.enabled:
+                metrics["attention_entropy"] = entropy
+
+        if self.config.metrics.fusion_mahalanobis.enabled:
+            metrics["fusion_mahalanobis"] = self.get_fusion_mahalanobis(td, entropy)
 
         if self.config.metrics.mahalanobis_distance.enabled:
             metrics["mahalanobis_distance"] = self.get_mahalanobis_distance()
@@ -361,6 +396,7 @@ class FailureMetrics:
         self.last_chunk_endpoint = None
         self.latest_temporal_disagreement = 0.0
         self.recent_disagreements.clear()
+        self.recent_entropies.clear()
         self.recent_actions.clear()
         self.recent_steps.clear()
         self.checkpoint_action_queue.clear()

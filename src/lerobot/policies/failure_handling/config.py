@@ -44,8 +44,17 @@ class MahalanobisConfig(BaseMetricConfig):
 
 
 @dataclass
+class FusionMahalanobisConfig(BaseMetricConfig):
+    window_size: int = 20
+    cp_threshold: float = 3.841
+    mu: list[float] = field(default_factory=lambda: [0.05, 0.002])
+    inv_cov: list[list[float]] = field(default_factory=lambda: [[100.0, -5.0], [-5.0, 50000.0]])
+
+
+@dataclass
 class MetricsConfig:
     temporal_disagreement: TemporalDisagreementConfig = field(default_factory=TemporalDisagreementConfig)
+    fusion_mahalanobis: FusionMahalanobisConfig = field(default_factory=FusionMahalanobisConfig)
     following_error: BaseMetricConfig = field(
         default_factory=lambda: BaseMetricConfig(enabled=True, threshold=0.05)
     )
