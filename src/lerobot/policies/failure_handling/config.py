@@ -34,7 +34,7 @@ class TemporalDisagreementConfig:
 
 @dataclass
 class BaseMetricConfig:
-    enabled: bool = False
+    enabled: bool = True
     threshold: float = 1.0
 
 
