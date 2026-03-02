@@ -112,7 +112,7 @@ def write_cp_threshold(
     with failure_handling_path.open("r", encoding="utf-8") as file:
         config = json.load(file)
 
-    config["cp_threshold"] = cp_threshold
+    config["metrics"]["temporal_disagreement"]["cp_threshold"] = cp_threshold
 
     with failure_handling_path.open("w", encoding="utf-8") as file:
         json.dump(config, file, indent=2, ensure_ascii=False)

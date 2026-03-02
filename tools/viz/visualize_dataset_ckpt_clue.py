@@ -37,6 +37,7 @@ CHECKPOINT_SIGNAL_CONFIG = {
     "valley_lookahead": 8,
     "smoothing_sigma": 2.0,
     "valley_prominence": None,
+    "safety_margin": 40,
 }
 
 
@@ -130,6 +131,7 @@ def build_checkpoint_series(
     valley_lookahead=8,
     smoothing_sigma=2.0,
     valley_prominence=None,
+    safety_margin=40,
 ):
     if not failure_metrics:
         return {}, {}, {}
@@ -148,7 +150,7 @@ def build_checkpoint_series(
     recent_steps = deque(maxlen=window_size)
 
     checkpoint_set = set()
-    latest_checkpoint = np.nan
+    checkpoint_history = []
 
     for step in steps:
         step_int = int(step)
@@ -186,10 +188,16 @@ def build_checkpoint_series(
 
             if is_valley:
                 checkpoint_set.add(eval_step)
-                latest_checkpoint = float(eval_step)
+                checkpoint_history.append(float(eval_step))
+
+        safe_checkpoint = np.nan
+        for cp in reversed(checkpoint_history):
+            if step_int - cp >= safety_margin:
+                safe_checkpoint = cp
+                break
 
         checkpoint_flag_by_step[step_int] = 1.0 if step_int in checkpoint_set else 0.0
-        previous_checkpoint_by_step[step_int] = latest_checkpoint
+        previous_checkpoint_by_step[step_int] = safe_checkpoint
 
     for step in steps:
         if step not in smoothed_by_step:
@@ -370,14 +378,14 @@ def visualize_dataset(repo_id, root=None, stride=7, checkpoint_signal_config=Non
     dataset_signal_cfg = {
         key: failure_handling_cfg[key] for key in CHECKPOINT_SIGNAL_CONFIG if key in failure_handling_cfg
     }
-    if "cp_threshold" in failure_handling_cfg:
+    if "metrics" in failure_handling_cfg:
         try:
-            cp_threshold = float(failure_handling_cfg["cp_threshold"])
+            cp_threshold = float(failure_handling_cfg["metrics"]["temporal_disagreement"]["cp_threshold"])
             print(f"Loaded cp_threshold from failure_handling.json: {cp_threshold:.6f}")
         except (TypeError, ValueError):
             print(
                 "Warning: cp_threshold exists in failure_handling config but is not a valid float. "
-                f"Got: {failure_handling_cfg['cp_threshold']}"
+                f"Got: {failure_handling_cfg['metrics']['temporal_disagreement']['cp_threshold']}"
             )
 
     signal_cfg = dict(CHECKPOINT_SIGNAL_CONFIG)
@@ -393,6 +401,7 @@ def visualize_dataset(repo_id, root=None, stride=7, checkpoint_signal_config=Non
         "valley_lookahead": signal_cfg["valley_lookahead"],
         "smoothing_sigma": signal_cfg["smoothing_sigma"],
         "valley_prominence": signal_cfg["valley_prominence"],
+        "safety_margin": signal_cfg["safety_margin"],
         "cp_threshold": cp_threshold,
         "is_failing_rule": "temporal_disagreement > cp_threshold",
     }
@@ -408,6 +417,7 @@ def visualize_dataset(repo_id, root=None, stride=7, checkpoint_signal_config=Non
             valley_lookahead=signal_cfg["valley_lookahead"],
             smoothing_sigma=signal_cfg["smoothing_sigma"],
             valley_prominence=signal_cfg["valley_prominence"],
+            safety_margin=signal_cfg["safety_margin"],
         )
         num_checkpoints = int(sum(checkpoint_flag_by_step.values()))
         print(
