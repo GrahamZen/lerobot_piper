@@ -44,7 +44,7 @@ class FailurePostprocessor:
         )
         self.metrics.bind_policy(self.policy)
 
-        self.vlm_service = VLMService()
+        self.vlm_service = VLMService(video_path=self.config.demo_video_path)
         self._hooks = []
 
         if self.config.enable_logging:
@@ -102,7 +102,7 @@ class FailurePostprocessor:
             )
 
             if self.config.enable_failure_handling:
-                self.metrics.append_state(intended_action)
+                self.metrics.append_state(intended_action, batch=batch)
 
             if self.config.enable_logging:
                 self.metrics.compute_and_log(
@@ -115,14 +115,11 @@ class FailurePostprocessor:
                     self.metrics.flush_metrics()
                     self.metrics.flush_features()
 
-        is_failure = False
-        if self.config.enable_failure_handling:
-            is_failure = self.metrics.detect_failure()
-
         self.metrics.process_step += 1
-
-        if is_failure:
-            return self._get_recovery_action(batch, intended_action)
+        if self.metrics.detect_failure():
+            recovery_action = self._get_recovery_action(batch, intended_action)
+            if self.config.enable_failure_handling:
+                return recovery_action
 
         return intended_action
 
@@ -134,10 +131,9 @@ class FailurePostprocessor:
         if not self.metrics.checkpoint_action_queue:
             return intended_action
 
-        checkpoint_indices = list(range(len(self.metrics.checkpoint_action_queue)))
         selected_index = self.vlm_service.select_checkpoint_index(
             batch=batch,
-            checkpoint_indices=checkpoint_indices,
+            checkpoint_queue=list(self.metrics.checkpoint_action_queue),
             episode=self.metrics.episode,
             step=self.metrics.process_step,
         )
@@ -145,7 +141,8 @@ class FailurePostprocessor:
         if selected_index is None or not (0 <= selected_index < len(self.metrics.checkpoint_action_queue)):
             selected_index = 0
 
-        _, checkpoint_action = self.metrics.checkpoint_action_queue[selected_index]
+        checkpoint_action = self.metrics.checkpoint_action_queue[selected_index][1]
+        self.vlm_service.save_debug_history()
         return checkpoint_action.to(intended_action.device)
 
     # ------------------------------------------------------------------

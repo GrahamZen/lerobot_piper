@@ -63,8 +63,9 @@ class FailureMetrics:
         self.recent_disagreements: deque = deque(maxlen=td_cfg.window_size)
         self.recent_actions: deque = deque(maxlen=td_cfg.window_size)
         self.recent_steps: deque = deque(maxlen=td_cfg.window_size)
+        self.recent_views: deque = deque(maxlen=td_cfg.window_size)
 
-        self.checkpoint_action_queue: deque[tuple[int, torch.Tensor]] = deque(
+        self.checkpoint_action_queue: deque[tuple[int, torch.Tensor, dict[str, torch.Tensor]]] = deque(
             maxlen=self.config.checkpoint_queue_size
         )
         self.checkpoint_step_set: set[int] = set()
@@ -168,6 +169,27 @@ class FailureMetrics:
     # State tracking and checkpoints
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _clone_tensor_for_checkpoint(tensor: torch.Tensor) -> torch.Tensor:
+        return tensor.detach().cpu().clone()
+
+    def _extract_checkpoint_views(self, batch: dict[str, torch.Tensor] | None) -> dict[str, torch.Tensor]:
+        if batch is None:
+            return {}
+
+        keys = (
+            "observation.images.left",
+            "observation.images.top",
+            "observation.images.right",
+        )
+
+        views: dict[str, torch.Tensor] = {}
+        for key in keys:
+            value = batch.get(key)
+            if isinstance(value, torch.Tensor):
+                views[key] = self._clone_tensor_for_checkpoint(value)
+        return views
+
     def update_checkpoint_queue(self) -> None:
         td_cfg = self.config.metrics.temporal_disagreement
         if not td_cfg.enabled:
@@ -209,12 +231,15 @@ class FailureMetrics:
             return
 
         checkpoint_action = self.recent_actions[eval_idx]
+        checkpoint_views = self.recent_views[eval_idx] if len(self.recent_views) > eval_idx else {}
 
         if len(self.checkpoint_action_queue) == self.checkpoint_action_queue.maxlen:
-            oldest_step, _ = self.checkpoint_action_queue[0]
+            oldest_step, _, _ = self.checkpoint_action_queue[0]
             self.checkpoint_step_set.discard(oldest_step)
 
-        self.checkpoint_action_queue.append((checkpoint_step, checkpoint_action.detach().clone()))
+        self.checkpoint_action_queue.append(
+            (checkpoint_step, checkpoint_action.detach().clone(), checkpoint_views)
+        )
         self.checkpoint_step_set.add(checkpoint_step)
 
         logger.debug(f"Registered new safe Checkpoint at step {checkpoint_step}")
@@ -229,13 +254,16 @@ class FailureMetrics:
             val = val.item()
         return val > td_cfg.cp_threshold
 
-    def append_state(self, intended_action: torch.Tensor) -> None:
+    def append_state(
+        self, intended_action: torch.Tensor, batch: dict[str, torch.Tensor] | None = None
+    ) -> None:
         td_cfg = self.config.metrics.temporal_disagreement
         if not td_cfg.enabled:
             return
 
         self.recent_steps.append(self.process_step)
         self.recent_actions.append(intended_action.detach().clone())
+        self.recent_views.append(self._extract_checkpoint_views(batch))
 
         val = self.latest_temporal_disagreement
         if torch.is_tensor(val):
@@ -363,5 +391,6 @@ class FailureMetrics:
         self.recent_disagreements.clear()
         self.recent_actions.clear()
         self.recent_steps.clear()
+        self.recent_views.clear()
         self.checkpoint_action_queue.clear()
         self.checkpoint_step_set.clear()

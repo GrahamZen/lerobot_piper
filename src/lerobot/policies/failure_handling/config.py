@@ -57,6 +57,7 @@ class MetricsConfig:
 
 @dataclass
 class FailureConfig:
+    demo_video_path: str | Path | None = None
     enable_logging: bool = True
     enable_failure_handling: bool = False
     flush_metrics_every_step: bool = False
