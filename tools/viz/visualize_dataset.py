@@ -19,6 +19,7 @@ from pathlib import Path
 
 import numpy as np
 import rerun as rr
+import rerun.blueprint as rrb
 from PIL import Image
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -45,7 +46,7 @@ def load_timing_series_from_npz(npz_path: Path):
     return series, steps
 
 
-def log_timing_curves_to_rerun(
+def build_timing_by_dataset_step(
     dataset_root: Path,
     timing_npz_path: str | None = None,
 ):
@@ -57,7 +58,7 @@ def log_timing_curves_to_rerun(
     series, x_vals = load_timing_series_from_npz(npz_path)
 
     if series is None:
-        return False
+        return None
 
     ordered_keys = [
         "obs_get_s",
@@ -76,13 +77,13 @@ def log_timing_curves_to_rerun(
     ]
     plot_keys = [k for k in ordered_keys if k in series] + [k for k in series if k not in ordered_keys]
 
+    timing_by_step = {}
     for timing_idx, step in enumerate(x_vals):
-        rr.set_time_sequence("timing_step", int(step))
-        for key in plot_keys:
-            rr.log(f"metrics/policy_timing/{key}", rr.Scalars(float(series[key][timing_idx])))
+        step_int = int(step)
+        timing_by_step[step_int] = {key: float(series[key][timing_idx]) for key in plot_keys}
 
-    print(f"[INFO] Logged timing curves to Rerun from: {npz_path}")
-    return True
+    print(f"[INFO] Loaded timing curves from: {npz_path}")
+    return timing_by_step
 
 
 class PiperFK:
@@ -226,7 +227,23 @@ def visualize_dataset(
     print("Initializing Rerun...")
     rr.init("LeRobot Dataset Visualizer", spawn=True)
 
-    log_timing_curves_to_rerun(
+    blueprint = rrb.Blueprint(
+        rrb.Horizontal(
+            rrb.Vertical(
+                rrb.TimeSeriesView(name="Policy Timing", origin="metrics/policy_timing"),
+                rrb.TimeSeriesView(name="Action Tensor", origin="vectors/action_tensor"),
+            ),
+            rrb.Vertical(
+                rrb.Spatial2DView(origin="cameras"),
+                rrb.Spatial3DView(origin="simulation"),
+            ),
+            column_shares=[2, 3],
+        ),
+        collapse_panels=True,
+    )
+    rr.send_blueprint(blueprint)
+
+    timing_by_dataset_step = build_timing_by_dataset_step(
         dataset_root,
         timing_npz_path=timing_npz_path,
     )
@@ -260,7 +277,12 @@ def visualize_dataset(
 
         for i in range(from_idx, to_idx, stride):
             # Set timelines - ONLY global_step to ensure continuous playback
-            rr.set_time_sequence("global_step", global_step)
+            rr.set_time("global_step", sequence=global_step)
+
+            if timing_by_dataset_step is not None and i in timing_by_dataset_step:
+                for key, value in timing_by_dataset_step[i].items():
+                    rr.log(f"metrics/policy_timing/{key}", rr.Scalars(value))
+
             global_step += 1
 
             # Update Overlay (Redundant to log every step but ensures it's always there)
