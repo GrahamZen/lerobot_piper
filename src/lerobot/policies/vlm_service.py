@@ -211,10 +211,10 @@ class VLMService:
         checkpoint_queue: list[tuple[Any, ...]],
         episode: int | None = None,
         step: int | None = None,
-    ) -> tuple[list[Any] | None, int]:
+    ) -> tuple[list[Any] | None, list[int]]:
         current_views = self._get_three_views(batch)
         if current_views is None:
-            return None, 0
+            return None, []
 
         current_img = self._stitch_three_views(*current_views)
         self.logger.info(
@@ -226,7 +226,7 @@ class VLMService:
             current_img,
         ]
 
-        candidate_count = 0
+        valid_candidate_indices: list[int] = []
         for idx, queue_entry in enumerate(checkpoint_queue):
             if len(queue_entry) < 3 or not isinstance(queue_entry[2], dict):
                 self.logger.info(
@@ -250,7 +250,7 @@ class VLMService:
                 f"This is candidate rollback point #{idx} (corresponding to step={step_num}):"
             )
             message_contents.append(chkpt_img)
-            candidate_count += 1
+            valid_candidate_indices.append(idx)
             self.logger.info(
                 "[VLMService.select_checkpoint_index] Added candidate idx=%d | stitched_size=%s",
                 idx,
@@ -261,7 +261,7 @@ class VLMService:
             "Please fully analyze the current failure state and all candidate rollback points first, "
             "then output <FINAL_ANSWER>index</FINAL_ANSWER> on the last line."
         )
-        return message_contents, candidate_count
+        return message_contents, valid_candidate_indices
 
     def _create_debug_record(
         self,
@@ -470,7 +470,7 @@ class VLMService:
         checkpoint_indices = list(range(len(checkpoint_queue)))
         self.logger.info("[VLMService.select_checkpoint_index] Candidate indices=%s", checkpoint_indices)
 
-        message_contents, candidate_count = self._build_message_contents(
+        message_contents, valid_candidate_indices = self._build_message_contents(
             batch=batch,
             checkpoint_queue=checkpoint_queue,
             episode=episode,
@@ -485,6 +485,7 @@ class VLMService:
             )
             return checkpoint_indices[0]
 
+        candidate_count = len(valid_candidate_indices)
         if candidate_count == 0:
             self.logger.warning(
                 "No candidate checkpoint views available for VLM; fallback to the first checkpoint."
@@ -493,6 +494,12 @@ class VLMService:
                 "[VLMService.select_checkpoint_index] No valid candidates. Fallback to index 0."
             )
             return checkpoint_indices[0]
+
+        if candidate_count < 5:
+            self.logger.warning(
+                "[VLMService.select_checkpoint_index] Fewer than 5 valid candidates: %d",
+                candidate_count,
+            )
 
         self.logger.info(
             "[VLMService.select_checkpoint_index] Sending request to VLM | message_parts=%d | valid_candidates=%d",
@@ -517,7 +524,7 @@ class VLMService:
             self.logger.info("[VLMService.select_checkpoint_index] Raw VLM reply:\n%s", reply)
             debug_record["response_text"] = reply
 
-            selected_index = self._parse_selected_index(reply, checkpoint_indices)
+            selected_index = self._parse_selected_index(reply, valid_candidate_indices)
             debug_record["selected_index"] = selected_index
 
             self.logger.info("[VLMService.select_checkpoint_index] Final selected_index=%d", selected_index)
