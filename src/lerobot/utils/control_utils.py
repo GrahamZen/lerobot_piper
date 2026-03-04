@@ -18,6 +18,7 @@
 
 
 import logging
+import time
 import traceback
 from contextlib import nullcontext
 from copy import copy
@@ -73,7 +74,9 @@ def predict_action(
     use_amp: bool,
     task: str | None = None,
     robot_type: str | None = None,
-):
+    return_timing: bool = False,
+    synchronize_timing: bool = False,
+) -> PolicyAction | tuple[PolicyAction, dict[str, float]]:
     """
     Performs a single-step inference to predict a robot action from an observation.
 
@@ -93,24 +96,53 @@ def predict_action(
         use_amp: A boolean to enable/disable Automatic Mixed Precision for CUDA inference.
         task: An optional string identifier for the task.
         robot_type: An optional string identifier for the robot type.
+        return_timing: If True, returns a tuple of (action, timing_dict).
+        synchronize_timing: If True and running on CUDA, synchronizes before and after
+            `policy.select_action` to measure actual GPU compute time for that segment.
 
     Returns:
         A `torch.Tensor` containing the predicted action, ready for the robot.
+        If `return_timing=True`, returns `(action, timing_dict)` where timing_dict includes:
+        `prepare_observation_s`, `preprocess_s`, `policy_select_action_s`, `postprocess_s`, `total_s`.
     """
     observation = copy(observation)
+    timings: dict[str, float] = {}
+    total_start_t = time.perf_counter()
+
     with (
         torch.inference_mode(),
         torch.autocast(device_type=device.type) if device.type == "cuda" and use_amp else nullcontext(),
     ):
+        stage_start_t = time.perf_counter()
         # Convert to pytorch format: channel first and float32 in [0,1] with batch dimension
         observation = prepare_observation_for_inference(observation, device, task, robot_type)
+        if return_timing:
+            timings["prepare_observation_s"] = time.perf_counter() - stage_start_t
+
+        stage_start_t = time.perf_counter()
         observation = preprocessor(observation)
+        if return_timing:
+            timings["preprocess_s"] = time.perf_counter() - stage_start_t
 
         # Compute the next action with the policy
         # based on the current observation
+        if return_timing and synchronize_timing and device.type == "cuda":
+            torch.cuda.synchronize(device)
+        stage_start_t = time.perf_counter()
         action = policy.select_action(observation)
+        if return_timing and synchronize_timing and device.type == "cuda":
+            torch.cuda.synchronize(device)
+        if return_timing:
+            timings["policy_select_action_s"] = time.perf_counter() - stage_start_t
 
+        stage_start_t = time.perf_counter()
         action = postprocessor(action)
+        if return_timing:
+            timings["postprocess_s"] = time.perf_counter() - stage_start_t
+
+    if return_timing:
+        timings["total_s"] = time.perf_counter() - total_start_t
+        return action, timings
 
     return action
 

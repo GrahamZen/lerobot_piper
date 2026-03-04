@@ -24,6 +24,67 @@ from PIL import Image
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 
+def load_timing_series_from_npz(npz_path: Path):
+    if not npz_path.exists():
+        return None, None
+
+    with np.load(npz_path, allow_pickle=False) as data:
+        series = {}
+        for key in data.files:
+            arr = np.asarray(data[key], dtype=np.float64)
+            if arr.ndim != 1 or arr.size == 0:
+                continue
+            series[key] = arr * 1e3
+
+    if not series:
+        return None, None
+
+    min_len = min(len(v) for v in series.values())
+    series = {k: v[:min_len] for k, v in series.items()}
+    steps = np.arange(min_len, dtype=np.int64)
+    return series, steps
+
+
+def log_timing_curves_to_rerun(
+    dataset_root: Path,
+    timing_npz_path: str | None = None,
+):
+    npz_path = (
+        Path(timing_npz_path).expanduser()
+        if timing_npz_path
+        else dataset_root / "meta" / "policy_timing_steps.npz"
+    )
+    series, x_vals = load_timing_series_from_npz(npz_path)
+
+    if series is None:
+        return False
+
+    ordered_keys = [
+        "obs_get_s",
+        "obs_process_s",
+        "build_observation_frame_s",
+        "prepare_observation_s",
+        "preprocess_s",
+        "policy_select_action_s",
+        "postprocess_s",
+        "policy_to_robot_action_s",
+        "send_action_s",
+        "dataset_write_s",
+        "ui_queue_s",
+        "loop_total_s",
+        "total_s",
+    ]
+    plot_keys = [k for k in ordered_keys if k in series] + [k for k in series if k not in ordered_keys]
+
+    for timing_idx, step in enumerate(x_vals):
+        rr.set_time_sequence("timing_step", int(step))
+        for key in plot_keys:
+            rr.log(f"metrics/policy_timing/{key}", rr.Scalars(float(series[key][timing_idx])))
+
+    print(f"[INFO] Logged timing curves to Rerun from: {npz_path}")
+    return True
+
+
 class PiperFK:
     def __init__(self):
         self.RADIAN = 180 / math.pi
@@ -135,13 +196,20 @@ class PiperFK:
                 rr.log(f"{prefix}/{link}", rr.Asset3D(path=mesh_path, albedo_factor=color), static=True)
 
 
-def visualize_dataset(repo_id, root=None, stride=7):
+def visualize_dataset(
+    repo_id,
+    root=None,
+    stride=7,
+    timing_npz_path=None,
+):
     print(f"Loading dataset: {repo_id}")
     try:
         dataset = LeRobotDataset(repo_id, root=root)
     except Exception as e:
         print(f"Failed to load dataset: {e}")
         return
+
+    dataset_root = Path(dataset.root)
 
     # Ensure episodes metadata
     if dataset.meta.episodes is None:
@@ -157,6 +225,11 @@ def visualize_dataset(repo_id, root=None, stride=7):
 
     print("Initializing Rerun...")
     rr.init("LeRobot Dataset Visualizer", spawn=True)
+
+    log_timing_curves_to_rerun(
+        dataset_root,
+        timing_npz_path=timing_npz_path,
+    )
 
     fk = PiperFK()
     print("Logging initial meshes...")
@@ -284,6 +357,17 @@ if __name__ == "__main__":
     parser.add_argument("--repo_id", type=str, help="Dataset repository ID")
     parser.add_argument("--root", type=str, default=None, help="Dataset root")
     parser.add_argument("--stride", type=int, default=7, help="Visualization stride (speed)")
+    parser.add_argument(
+        "--timing_npz_path",
+        type=str,
+        default=None,
+        help="Optional timing npz path. Default: <dataset_root>/meta/policy_timing_steps.npz",
+    )
 
     args = parser.parse_args()
-    visualize_dataset(args.repo_id, args.root, args.stride)
+    visualize_dataset(
+        args.repo_id,
+        args.root,
+        args.stride,
+        timing_npz_path=args.timing_npz_path,
+    )

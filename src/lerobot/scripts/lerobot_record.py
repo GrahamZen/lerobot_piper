@@ -75,6 +75,7 @@ from pathlib import Path
 from pprint import pformat
 from typing import Any
 
+import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from PIL import Image, ImageTk
@@ -457,6 +458,14 @@ class RecordConfig:
     play_sounds: bool = True
     # Resume recording on an existing dataset.
     resume: bool = False
+    # Enable segmented policy and loop timing logs during recording.
+    profile_policy_timing: bool = True
+    # Log timing summary every N control steps when profiling is enabled.
+    profile_policy_timing_interval: int = 100
+    # Synchronize CUDA before/after policy forward timing for accurate GPU latency.
+    profile_policy_timing_cuda_sync: bool = True
+    # Optional path to per-step timing npz. If None, defaults to <dataset_root>/meta/policy_timing_steps.npz.
+    profile_policy_timing_npz_path: str | Path | None = None
 
     def __post_init__(self):
         # HACK: We parse again the cli args here to get the pretrained path if there was one.
@@ -532,6 +541,10 @@ def record_loop(
     display_compressed_images: bool = False,
     msg_queue: queue.Queue | None = None,
     current_status: str | None = None,
+    profile_inference: bool = False,
+    profile_inference_interval: int = 100,
+    profile_inference_cuda_sync: bool = True,
+    timing_npz_path: str | Path | None = None,
 ):
     if dataset is not None and dataset.fps != fps:
         raise ValueError(f"The dataset fps should be equal to requested fps ({dataset.fps} != {fps}).")
@@ -567,27 +580,73 @@ def record_loop(
         preprocessor.reset()
         postprocessor.reset()
 
+    def append_timing(history: dict[str, list[float]], sample: dict[str, float]) -> None:
+        for key, value in sample.items():
+            history.setdefault(key, []).append(value)
+
+    def append_timing_npz(npz_path: str | Path, history: dict[str, list[float]]) -> None:
+        path = Path(npz_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        new_arrays = {
+            key: np.asarray(values, dtype=np.float64) for key, values in history.items() if len(values) > 0
+        }
+        if not new_arrays:
+            return
+
+        if path.exists():
+            try:
+                with np.load(path, allow_pickle=False) as existing:
+                    merged = {}
+                    all_keys = set(existing.files) | set(new_arrays.keys())
+                    for key in all_keys:
+                        old_arr = existing[key] if key in existing.files else np.empty((0,), dtype=np.float64)
+                        new_arr = new_arrays.get(key, np.empty((0,), dtype=np.float64))
+                        merged[key] = np.concatenate([old_arr, new_arr], axis=0)
+                np.savez_compressed(path, **merged)
+            except Exception as e:
+                logging.warning(f"Failed to append timing npz at {path}, rewriting file: {e}")
+                np.savez_compressed(path, **new_arrays)
+        else:
+            np.savez_compressed(path, **new_arrays)
+
+    profiling_enabled = (
+        profile_inference and policy is not None and preprocessor is not None and postprocessor is not None
+    )
+    timing_history: dict[str, list[float]] = {}
+    profiled_steps = 0
+
     timestamp = 0
     start_episode_t = time.perf_counter()
     while timestamp < control_time_s:
         start_loop_t = time.perf_counter()
+        step_timings: dict[str, float] = {}
 
         if events["exit_early"]:
             events["exit_early"] = False
             break
 
         # Get robot observation
+        stage_start_t = time.perf_counter()
         obs = robot.get_observation()
+        if profiling_enabled:
+            step_timings["obs_get_s"] = time.perf_counter() - stage_start_t
 
         # Applies a pipeline to the raw robot observation, default is IdentityProcessor
+        stage_start_t = time.perf_counter()
         obs_processed = robot_observation_processor(obs)
+        if profiling_enabled:
+            step_timings["obs_process_s"] = time.perf_counter() - stage_start_t
 
         if policy is not None or dataset is not None:
+            stage_start_t = time.perf_counter()
             observation_frame = build_dataset_frame(dataset.features, obs_processed, prefix=OBS_STR)
+            if profiling_enabled:
+                step_timings["build_observation_frame_s"] = time.perf_counter() - stage_start_t
 
         # Get action from either policy or teleop
         if policy is not None and preprocessor is not None and postprocessor is not None:
-            action_values = predict_action(
+            predict_output = predict_action(
                 observation=observation_frame,
                 policy=policy,
                 device=get_safe_torch_device(policy.config.device),
@@ -596,9 +655,20 @@ def record_loop(
                 use_amp=policy.config.use_amp,
                 task=single_task,
                 robot_type=robot.robot_type,
+                return_timing=profiling_enabled,
+                synchronize_timing=profile_inference_cuda_sync,
             )
 
+            if profiling_enabled:
+                action_values, policy_timings = predict_output
+                step_timings.update(policy_timings)
+            else:
+                action_values = predict_output
+
+            stage_start_t = time.perf_counter()
             act_processed_policy: RobotAction = make_robot_action(action_values, dataset.features)
+            if profiling_enabled:
+                step_timings["policy_to_robot_action_s"] = time.perf_counter() - stage_start_t
 
         elif policy is None and isinstance(teleop, Teleoperator):
             act = teleop.get_action()
@@ -628,13 +698,19 @@ def record_loop(
         # Action can eventually be clipped using `max_relative_target`,
         # so action actually sent is saved in the dataset. action = postprocessor.process(action)
         # TODO(steven, pepijn, adil): we should use a pipeline step to clip the action, so the sent action is the action that we input to the robot.
+        stage_start_t = time.perf_counter()
         _sent_action = robot.send_action(robot_action_to_send)
+        if profiling_enabled:
+            step_timings["send_action_s"] = time.perf_counter() - stage_start_t
 
         # Write to dataset
         if dataset is not None:
+            stage_start_t = time.perf_counter()
             action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)
             frame = {**observation_frame, **action_frame, "task": single_task}
             dataset.add_frame(frame)
+            if profiling_enabled:
+                step_timings["dataset_write_s"] = time.perf_counter() - stage_start_t
 
         if display_data:
             log_rerun_data(
@@ -643,6 +719,7 @@ def record_loop(
 
         # Send images to UI
         if msg_queue is not None:
+            stage_start_t = time.perf_counter()
             ui_data = {}
             # Camera images
             if hasattr(robot, "cameras"):
@@ -668,8 +745,14 @@ def record_loop(
             if ui_data:
                 with contextlib.suppress(queue.Full):
                     msg_queue.put_nowait(ui_data)
+            if profiling_enabled:
+                step_timings["ui_queue_s"] = time.perf_counter() - stage_start_t
 
         dt_s = time.perf_counter() - start_loop_t
+        if profiling_enabled:
+            step_timings["loop_total_s"] = dt_s
+            append_timing(timing_history, step_timings)
+            profiled_steps += 1
 
         sleep_time_s: float = 1 / fps - dt_s
         if sleep_time_s < 0:
@@ -680,6 +763,13 @@ def record_loop(
         precise_sleep(max(sleep_time_s, 0.0))
 
         timestamp = time.perf_counter() - start_episode_t
+
+    if profiling_enabled and profiled_steps > 0 and timing_npz_path is not None:
+        try:
+            append_timing_npz(timing_npz_path, timing_history)
+            logging.info("Saved per-step timing samples to %s", timing_npz_path)
+        except Exception as e:
+            logging.warning(f"Failed to save per-step timing npz: {e}")
 
 
 @parser.wrap()
@@ -716,6 +806,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
     dataset = None
     listener = None
+    timing_npz_path: Path | None = None
 
     try:
         if cfg.resume:
@@ -759,6 +850,12 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 logging.info(f"Saved recording config to {config_path}")
             except Exception as e:
                 logging.warning(f"Failed to save recording config: {e}")
+
+        if cfg.profile_policy_timing and dataset is not None:
+            if cfg.profile_policy_timing_npz_path is not None:
+                timing_npz_path = Path(cfg.profile_policy_timing_npz_path)
+            else:
+                timing_npz_path = Path(dataset.root) / "meta" / "policy_timing_steps.npz"
 
         # Load pretrained policy
         policy = None if cfg.policy is None else make_policy(cfg.policy, ds_meta=dataset.meta)
@@ -811,6 +908,10 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     display_compressed_images=display_compressed_images,
                     msg_queue=msg_queue,
                     current_status=f"Recording Episode {dataset.num_episodes}",
+                    profile_inference=cfg.profile_policy_timing,
+                    profile_inference_interval=cfg.profile_policy_timing_interval,
+                    profile_inference_cuda_sync=cfg.profile_policy_timing_cuda_sync,
+                    timing_npz_path=timing_npz_path,
                 )
 
                 # Execute a few seconds without recording to give time to manually reset the environment
