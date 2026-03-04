@@ -8,7 +8,6 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as F  # noqa: N812
-from scipy.ndimage import gaussian_filter1d
 
 from lerobot.policies.failure_handling.config import FailureConfig
 
@@ -53,6 +52,7 @@ class FailureMetrics:
         self.episode: int = 0
         self.process_step: int = 0
         self.latest_temporal_disagreement: float = 0.0
+        self.latest_smoothed_disagreement: float = 0.0
 
         # Buffers for JSONL logs and mahalanobis feature dumps
         self.metrics_buffer: list[dict[str, Any]] = []
@@ -173,6 +173,27 @@ class FailureMetrics:
     def _clone_tensor_for_checkpoint(tensor: torch.Tensor) -> torch.Tensor:
         return tensor.detach().cpu().clone()
 
+    @staticmethod
+    def _causal_gaussian_series(values: np.ndarray, *, sigma: float = 4.0) -> np.ndarray:
+        n = len(values)
+        if n == 0:
+            return np.array([], dtype=np.float64)
+        if sigma <= 0:
+            return np.asarray(values, dtype=np.float64)
+
+        out = np.empty(n, dtype=np.float64)
+        radius = int(np.ceil(4 * sigma))
+        offsets = np.arange(radius + 1, dtype=np.float64)
+        kernel = np.exp(-0.5 * (offsets / sigma) ** 2)
+
+        for t in range(n):
+            w = min(t + 1, len(kernel))
+            k = kernel[:w]
+            k_norm = k / k.sum()
+            out[t] = np.dot(k_norm, values[t - w + 1 : t + 1][::-1])
+
+        return out
+
     def _extract_checkpoint_views(self, batch: dict[str, torch.Tensor] | None) -> dict[str, torch.Tensor]:
         if batch is None:
             return {}
@@ -190,15 +211,12 @@ class FailureMetrics:
                 views[key] = self._clone_tensor_for_checkpoint(value)
         return views
 
-    def update_checkpoint_queue(self) -> None:
+    def update_checkpoint_queue(self, smoothed_window: np.ndarray) -> None:
         td_cfg = self.config.metrics.temporal_disagreement
         if not td_cfg.enabled:
             return
 
-        disagreements = list(self.recent_disagreements)
-        total = len(disagreements)
-
-        smoothed_window = gaussian_filter1d(np.array(disagreements), sigma=td_cfg.smoothing_sigma)
+        total = len(self.recent_disagreements)
         eval_idx = total - 1 - td_cfg.eval_delay
 
         eval_val = smoothed_window[eval_idx]
@@ -249,7 +267,7 @@ class FailureMetrics:
         if not td_cfg.enabled:
             return False
 
-        val = self.latest_temporal_disagreement
+        val = self.latest_smoothed_disagreement
         if torch.is_tensor(val):
             val = val.item()
         return val > td_cfg.cp_threshold
@@ -270,9 +288,14 @@ class FailureMetrics:
             val = val.item()
         self.recent_disagreements.append(val)
 
+        disagreements_arr = np.array(self.recent_disagreements, dtype=np.float64)
+        smoothed_window = self._causal_gaussian_series(disagreements_arr, sigma=td_cfg.smoothing_sigma)
+        if len(smoothed_window) > 0:
+            self.latest_smoothed_disagreement = float(smoothed_window[-1])
+
         min_required = td_cfg.eval_delay + td_cfg.valley_lookback + 1
         if len(self.recent_disagreements) >= min_required:
-            self.update_checkpoint_queue()
+            self.update_checkpoint_queue(smoothed_window)
 
     def compute_and_log(self, actions_chunk, target_qpos=None, actual_qpos=None, temporal_disagreement=None):
         metrics = {
@@ -388,6 +411,7 @@ class FailureMetrics:
         self.last_attn_weights = None
         self.last_chunk_endpoint = None
         self.latest_temporal_disagreement = 0.0
+        self.latest_smoothed_disagreement = 0.0
         self.recent_disagreements.clear()
         self.recent_actions.clear()
         self.recent_steps.clear()

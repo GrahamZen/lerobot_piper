@@ -1,27 +1,31 @@
 import io
-import json
-from collections import deque
 from pathlib import Path
 from typing import Any
 
 import imageio
 import numpy as np
 from PIL import Image
-from scipy.ndimage import gaussian_filter1d
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
+try:
+    from tools.failure.offline_utils import (
+        load_failure_config,
+        load_failure_handling_json,
+        load_failure_metrics_jsonl,
+        replay_checkpoint_series,
+    )
+except ModuleNotFoundError:
+    from offline_utils import (
+        load_failure_config,
+        load_failure_handling_json,
+        load_failure_metrics_jsonl,
+        replay_checkpoint_series,
+    )
+
 
 class EpisodeFailureExtractor:
-    CHECKPOINT_SIGNAL_CONFIG = {
-        "window_size": 31,
-        "eval_delay": 15,
-        "valley_lookback": 8,
-        "valley_lookahead": 8,
-        "smoothing_sigma": 2.0,
-        "valley_prominence": None,
-        "safety_margin": 40,
-    }
+    SAFETY_MARGIN = 40
 
     def __init__(self, repo_id: str):
         self.repo_id = repo_id
@@ -36,23 +40,19 @@ class EpisodeFailureExtractor:
 
             self.dataset.meta.episodes = load_episodes(self.dataset.root)
 
-        self.failure_metrics = self._load_failure_metrics()
-        self.failure_handling_cfg = self._load_checkpoint_signal_config_from_dataset(self.dataset.root)
+        self.failure_metrics = load_failure_metrics_jsonl(self.dataset.root)
+        self.failure_handling_cfg = load_failure_handling_json(self.dataset.root)
+        self.failure_config = load_failure_config(self.dataset.root)
         self.td_cp_threshold = self._resolve_cp_threshold(self.failure_handling_cfg)
         (
             self.smoothed_td_by_step,
             self.previous_checkpoint_by_step,
             self.checkpoint_flag_by_step,
             self.recent_checkpoints_by_step,
-        ) = self._build_checkpoint_series(
+        ) = replay_checkpoint_series(
             self.failure_metrics,
-            window_size=self.CHECKPOINT_SIGNAL_CONFIG["window_size"],
-            eval_delay=self.CHECKPOINT_SIGNAL_CONFIG["eval_delay"],
-            valley_lookback=self.CHECKPOINT_SIGNAL_CONFIG["valley_lookback"],
-            valley_lookahead=self.CHECKPOINT_SIGNAL_CONFIG["valley_lookahead"],
-            smoothing_sigma=self.CHECKPOINT_SIGNAL_CONFIG["smoothing_sigma"],
-            valley_prominence=self.CHECKPOINT_SIGNAL_CONFIG["valley_prominence"],
-            safety_margin=self.CHECKPOINT_SIGNAL_CONFIG["safety_margin"],
+            self.failure_config,
+            safety_margin=self.SAFETY_MARGIN,
         )
 
     def save_failure_images(self, episode_index: int, save_dir: str | Path) -> dict:
@@ -190,63 +190,6 @@ class EpisodeFailureExtractor:
         )
         return from_idx, to_idx
 
-    def _load_failure_metrics(self) -> dict[int, dict[str, Any]]:
-        failure_metrics: dict[int, dict[str, Any]] = {}
-        metrics_path = Path(self.dataset.root) / "failure_metrics.jsonl"
-        if not metrics_path.exists():
-            return failure_metrics
-
-        with open(metrics_path) as f:
-            for line in f:
-                try:
-                    row = json.loads(line)
-                    if "step" in row:
-                        failure_metrics[int(row["step"])] = row
-                except (json.JSONDecodeError, TypeError, ValueError, KeyError):
-                    continue
-        return failure_metrics
-
-    def _load_checkpoint_signal_config_from_dataset(self, dataset_root: str | Path) -> dict:
-        record_config_path = Path(dataset_root) / "meta" / "record_config.json"
-        if not record_config_path.exists():
-            return {}
-
-        try:
-            with open(record_config_path) as f:
-                record_config = json.load(f)
-        except Exception:
-            return {}
-
-        pretrained_path = record_config.get("pretrained_path")
-        if not pretrained_path and isinstance(record_config.get("policy"), dict):
-            pretrained_path = record_config["policy"].get("pretrained_path")
-
-        if not pretrained_path:
-            for key in ("model", "train", "training"):
-                section = record_config.get(key)
-                if isinstance(section, dict) and section.get("pretrained_path"):
-                    pretrained_path = section["pretrained_path"]
-                    break
-
-        if not pretrained_path:
-            return {}
-
-        pretrained_path = Path(pretrained_path).expanduser()
-        failure_handling_json_path = pretrained_path / "failure_handling.json"
-
-        if not failure_handling_json_path.exists():
-            nested_candidate = pretrained_path / "pretrained_model" / "failure_handling.json"
-            if nested_candidate.exists():
-                failure_handling_json_path = nested_candidate
-            else:
-                return {}
-
-        try:
-            with open(failure_handling_json_path) as f:
-                return json.load(f)
-        except Exception:
-            return {}
-
     def _resolve_cp_threshold(self, failure_handling_cfg: dict) -> float:
         td_cp_threshold = None
 
@@ -259,92 +202,6 @@ class EpisodeFailureExtractor:
         if td_cp_threshold is None:
             return float("inf")
         return float(td_cp_threshold)
-
-    def _build_checkpoint_series(
-        self,
-        failure_metrics,
-        window_size=31,
-        eval_delay=15,
-        valley_lookback=8,
-        valley_lookahead=8,
-        smoothing_sigma=3.0,
-        valley_prominence=None,
-        safety_margin=40,
-    ):
-        if not failure_metrics:
-            return {}, {}, {}, {}
-
-        steps = np.array(sorted(failure_metrics.keys()), dtype=np.int64)
-        smoothed_by_step = {}
-        checkpoint_flag_by_step = {}
-        previous_checkpoint_by_step = {}
-
-        eval_delay = max(eval_delay, valley_lookahead)
-        min_required = eval_delay + valley_lookback + 1
-        window_size = max(window_size, min_required)
-
-        recent_raw = deque(maxlen=window_size)
-        recent_steps = deque(maxlen=window_size)
-        checkpoint_set = set()
-        checkpoint_history = []
-        recent_checkpoints_by_step = {}
-
-        for step in steps:
-            step_int = int(step)
-            disagreement = float(failure_metrics[step_int].get("temporal_disagreement", 0.0))
-            recent_raw.append(disagreement)
-            recent_steps.append(step_int)
-
-            if len(recent_raw) >= min_required:
-                smoothed_window = gaussian_filter1d(np.array(recent_raw), sigma=smoothing_sigma)
-                eval_idx = len(recent_raw) - 1 - eval_delay
-                eval_val = smoothed_window[eval_idx]
-                eval_step = recent_steps[eval_idx]
-                smoothed_by_step[eval_step] = eval_val
-
-                past_vals = smoothed_window[eval_idx - valley_lookback : eval_idx]
-                future_vals = smoothed_window[eval_idx + 1 : eval_idx + 1 + valley_lookahead]
-
-                current_prominence = (
-                    valley_prominence
-                    if valley_prominence is not None
-                    else max(1e-6, 0.35 * float(np.std(smoothed_window)))
-                )
-
-                is_valley = True
-                if eval_val > min(past_vals) or eval_val >= min(future_vals):
-                    is_valley = False
-                else:
-                    if (
-                        max(past_vals) - eval_val < current_prominence
-                        or max(future_vals) - eval_val < current_prominence
-                    ):
-                        is_valley = False
-
-                if is_valley:
-                    checkpoint_set.add(eval_step)
-                    checkpoint_history.append(float(eval_step))
-
-            safe_checkpoint = np.nan
-            for cp in reversed(checkpoint_history):
-                if step_int - cp >= safety_margin:
-                    safe_checkpoint = cp
-                    break
-
-            checkpoint_flag_by_step[step_int] = 1.0 if step_int in checkpoint_set else 0.0
-            previous_checkpoint_by_step[step_int] = safe_checkpoint
-            recent_checkpoints_by_step[step_int] = [int(cp) for cp in checkpoint_history[-5:]]
-
-        for step in steps:
-            if step not in smoothed_by_step:
-                smoothed_by_step[step] = float(failure_metrics[step].get("temporal_disagreement", 0.0))
-
-        return (
-            smoothed_by_step,
-            previous_checkpoint_by_step,
-            checkpoint_flag_by_step,
-            recent_checkpoints_by_step,
-        )
 
     def _to_uint8_image_array(self, arr):
         arr = np.asarray(arr)
