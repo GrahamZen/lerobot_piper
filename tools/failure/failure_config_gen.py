@@ -25,6 +25,7 @@ from pathlib import Path
 import imageio
 import numpy as np
 from PIL import Image
+from tqdm import tqdm
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
@@ -116,23 +117,48 @@ def resolve_pretrained_path(record_config: dict) -> Path:
     return Path(pretrained_path).expanduser()
 
 
-def _resolve_template_failure_handling_path() -> Path:
-    return (
-        Path(__file__).resolve().parent / "failure" / "examples" / "pick_up_markers" / "failure_handling.json"
-    )
-
-
 def load_or_create_failure_handling_config(failure_handling_path: Path) -> dict:
     if failure_handling_path.exists():
         with failure_handling_path.open("r", encoding="utf-8") as file:
             return json.load(file)
 
-    template_path = _resolve_template_failure_handling_path()
-    if not template_path.exists():
-        raise FileNotFoundError(f"Template failure_handling.json not found. Expected at: {template_path}")
-
-    with template_path.open("r", encoding="utf-8") as file:
-        return json.load(file)
+    # Default configuration
+    return {
+        "demo_video_path": "demo.mp4",
+        "enable_logging": True,
+        "enable_failure_handling": False,
+        "flush_metrics_every_step": False,
+        "checkpoint_queue_size": 5,
+        "metrics": {
+            "temporal_disagreement": {
+                "enabled": True,
+                "failure_threshold": 0.3,
+                "cp_threshold": 0.23238854094630587,
+                "window_size": 31,
+                "eval_delay": 15,
+                "smoothing_sigma": 5.0,
+                "valley_lookback": 8,
+                "valley_lookahead": 8,
+                "valley_prominence": 0.0,
+            },
+            "following_error": {
+                "enabled": True,
+                "threshold": 0.05,
+            },
+            "attention_entropy": {
+                "enabled": True,
+            },
+            "mahalanobis_distance": {
+                "enabled": True,
+            },
+            "endpoint_shift": {
+                "enabled": True,
+            },
+            "action_jerk": {
+                "enabled": True,
+            },
+        },
+    }
 
 
 def _set_cp_threshold(config: dict, cp_threshold: float) -> None:
@@ -294,12 +320,15 @@ def export_first_episode_video(
 
     writer = imageio.get_writer(video_path, fps=fps)
     try:
-        for step_idx in range(from_idx, to_idx):
-            if step_idx == from_idx:
-                frame_img = first_frame_img
-            else:
-                frame_img = _build_triplet_frame_image(dataset[step_idx], scale)
-            writer.append_data(np.array(frame_img, dtype=np.uint8))
+        total_frames = to_idx - from_idx
+        with tqdm(total=total_frames, desc="Exporting video", unit="frame") as pbar:
+            for step_idx in range(from_idx, to_idx):
+                if step_idx == from_idx:
+                    frame_img = first_frame_img
+                else:
+                    frame_img = _build_triplet_frame_image(dataset[step_idx], scale)
+                writer.append_data(np.array(frame_img, dtype=np.uint8))
+                pbar.update(1)
     finally:
         writer.close()
 
