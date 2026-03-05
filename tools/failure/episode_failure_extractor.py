@@ -53,6 +53,7 @@ class EpisodeFailureExtractor:
             self.failure_metrics,
             self.failure_config,
             safety_margin=self.SAFETY_MARGIN,
+            dataset_episodes=self.dataset.meta.episodes,
         )
 
     def save_failure_images(self, episode_index: int, save_dir: str | Path) -> dict:

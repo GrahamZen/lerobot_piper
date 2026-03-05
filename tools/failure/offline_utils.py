@@ -118,6 +118,7 @@ def replay_checkpoint_series(
     config: FailureConfig,
     *,
     safety_margin: int = 40,
+    dataset_episodes: list[dict[str, Any]] | None = None,
 ) -> tuple[dict[int, float], dict[int, float], dict[int, float], dict[int, list[int]]]:
     if not failure_metrics:
         return {}, {}, {}, {}
@@ -134,8 +135,37 @@ def replay_checkpoint_series(
 
     checkpoint_set: set[int] = set()
     checkpoint_history: list[int] = []
+    checkpoint_set_in_episode: set[int] = set()
+
+    episode_bounds: list[tuple[int, int]] = []
+    if dataset_episodes is not None:
+        for ep_meta in dataset_episodes:
+            from_idx = int(
+                ep_meta["dataset_from_index"]
+                if not isinstance(ep_meta["dataset_from_index"], list)
+                else ep_meta["dataset_from_index"][0]
+            )
+            to_idx = int(
+                ep_meta["dataset_to_index"]
+                if not isinstance(ep_meta["dataset_to_index"], list)
+                else ep_meta["dataset_to_index"][0]
+            )
+            episode_bounds.append((from_idx, to_idx))
+        episode_bounds.sort(key=lambda x: x[0])
+
+    current_episode_idx = 0
 
     for step in steps:
+        if episode_bounds:
+            while (
+                current_episode_idx < len(episode_bounds)
+                and int(step) >= episode_bounds[current_episode_idx][1]
+            ):
+                current_episode_idx += 1
+                metrics_engine = FailureMetrics(config=replay_cfg, output_dir=None)
+                checkpoint_history = []
+                checkpoint_set_in_episode = set()
+
         disagreement = float(failure_metrics[step].get("temporal_disagreement", 0.0))
 
         metrics_engine.process_step = int(step)
@@ -146,8 +176,9 @@ def replay_checkpoint_series(
 
         queue_steps = [int(cp_step) for cp_step, _, _ in metrics_engine.checkpoint_action_queue]
         for cp_step in queue_steps:
-            if cp_step not in checkpoint_set:
-                checkpoint_set.add(cp_step)
+            checkpoint_set.add(cp_step)
+            if cp_step not in checkpoint_set_in_episode:
+                checkpoint_set_in_episode.add(cp_step)
                 checkpoint_history.append(cp_step)
 
         safe_checkpoint = float("nan")

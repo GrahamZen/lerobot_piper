@@ -293,6 +293,7 @@ def visualize_dataset(
             failure_metrics,
             failure_cfg,
             safety_margin=safety_margin,
+            dataset_episodes=dataset.meta.episodes,
         )
 
         # Step 2: pass TD in and compute Mahalanobis-based fused features
