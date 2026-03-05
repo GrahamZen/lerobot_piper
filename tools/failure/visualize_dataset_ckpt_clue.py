@@ -391,6 +391,11 @@ def visualize_dataset(
             rr.SeriesPoints(colors=[255, 0, 0], markers="circle", marker_sizes=6.0),
             static=True,
         )
+        rr.log(
+            "metrics/temporal_disagreement_smoothed/failed_markers",
+            rr.SeriesPoints(colors=[255, 0, 0], markers="circle", marker_sizes=6.0),
+            static=True,
+        )
         # Register red markers for Mahalanobis distance
         rr.log(
             "metrics/mahalanobis_fusion_dist/failed_markers",
@@ -493,6 +498,7 @@ def visualize_dataset(
 
                 if i in td_failed_step_set:
                     rr.log("metrics/temporal_disagreement/failed_markers", rr.Scalars(raw_td))
+                    rr.log("metrics/temporal_disagreement_smoothed/failed_markers", rr.Scalars(smooth_td))
                     rr.log(
                         "metrics/previous_checkpoint_step/failed_markers",
                         rr.Scalars(previous_checkpoint_by_step.get(i, np.nan)),
