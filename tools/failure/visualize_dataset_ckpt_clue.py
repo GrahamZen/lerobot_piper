@@ -324,6 +324,10 @@ def visualize_dataset(
 
     if failure_metrics:
         camera_views = [rrb.Spatial2DView(origin=f"cameras/{cam}") for cam in camera_names]
+        id_overlay_view = rrb.TextDocumentView(
+            name="Episode ID",
+            origin="overlay/episode_id",
+        )
 
         blueprint = rrb.Blueprint(
             rrb.Horizontal(
@@ -368,10 +372,7 @@ def visualize_dataset(
                         rrb.Spatial2DView(name="Checkpoint -1", origin="checkpoints/cp_4"),
                     ),
                 ),
-                rrb.Vertical(
-                    rrb.Vertical(*camera_views) if camera_views else rrb.Spatial3DView(origin="simulation"),
-                    row_shares=[5, 1],
-                ),
+                rrb.Vertical(*camera_views, id_overlay_view, row_shares=[6] * len(camera_views) + [1]),
                 column_shares=[2, 1],
             ),
             collapse_panels=True,
@@ -424,7 +425,7 @@ def visualize_dataset(
         for i in range(from_idx, to_idx, stride):
             rr.set_time_sequence("global_step", global_step)
             global_step += 1
-            rr.log("overlay/episode_id", rr.TextDocument(f"# Episode {episode_idx}"), static=False)
+            rr.log("overlay/episode_id", rr.TextDocument(f"{episode_idx}"), static=False)
 
             item = None
             try:
