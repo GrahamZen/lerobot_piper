@@ -200,7 +200,7 @@ class FailureMetrics:
 
         keys = (
             "observation.images.left",
-            "observation.images.top",
+            "observation.images.middle",
             "observation.images.right",
         )
 
@@ -270,6 +270,9 @@ class FailureMetrics:
         val = self.latest_smoothed_disagreement
         if torch.is_tensor(val):
             val = val.item()
+        logger.debug(
+            f"Evaluating failure detection: smoothed_td={val:.4f}, threshold={td_cfg.cp_threshold:.4f}"
+        )
         return val > td_cfg.cp_threshold
 
     def append_state(

@@ -19,7 +19,7 @@ class VLMService:
     def __init__(
         self,
         video_path: str,
-        api_key: str = "",
+        api_key: str = None,
         model_name: str = "gemini-2.5-pro",
     ):
         """
@@ -40,7 +40,7 @@ class VLMService:
         self.log_file_path = os.path.join(self.log_dir, "vlm_service.log")
         self.logger = self._setup_logger(model_name=model_name, video_path=video_path, masked_key=masked_key)
         self.to_pil = ToPILImage()
-        if api_key == "":
+        if self.api_key is None:
             self.logger.warning("API key is empty.")
             self.client = None
             return
@@ -152,6 +152,15 @@ class VLMService:
                 raise ValueError(
                     f"{view_name} must have shape (C, H, W) or (B, C, H, W), got {tuple(view_tensor.shape)}"
                 )
+
+            if view_tensor.is_floating_point():
+                if view_tensor.min() < 0:
+                    mean = torch.tensor([0.485, 0.456, 0.406], device=view_tensor.device).view(3, 1, 1)
+                    std = torch.tensor([0.229, 0.224, 0.225], device=view_tensor.device).view(3, 1, 1)
+                    view_tensor = view_tensor * std + mean
+
+                view_tensor = torch.clamp(view_tensor, 0.0, 1.0)
+
             return view_tensor
 
         left_tensor = _prepare_view_tensor(left_tensor, "left_tensor")
@@ -188,7 +197,7 @@ class VLMService:
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
         required_view_keys = (
             "observation.images.left",
-            "observation.images.top",
+            "observation.images.middle",
             "observation.images.right",
         )
         missing_keys = [k for k in required_view_keys if k not in views]
@@ -201,7 +210,7 @@ class VLMService:
             return None
         return (
             views["observation.images.left"],
-            views["observation.images.top"],
+            views["observation.images.middle"],
             views["observation.images.right"],
         )
 

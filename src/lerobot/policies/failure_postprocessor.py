@@ -7,6 +7,7 @@ from lerobot.policies.failure_handling.config import FailureConfig
 from lerobot.policies.failure_handling.metrics import FailureMetrics
 from lerobot.policies.vlm_service import VLMService
 from lerobot.utils.constants import OBS_STATE
+from lerobot.utils.utils import log_say
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +102,7 @@ class FailurePostprocessor:
                 new_actions_chunk
             )
 
-            if self.config.enable_failure_handling:
+            if self.config.metrics.temporal_disagreement.enabled:
                 self.metrics.append_state(intended_action, batch=batch)
 
             if self.config.enable_logging:
@@ -117,9 +118,12 @@ class FailurePostprocessor:
 
         self.metrics.process_step += 1
         if self.metrics.detect_failure():
-            recovery_action = self._get_recovery_action(batch, intended_action)
-            if self.config.enable_failure_handling:
-                return recovery_action
+            log_say("Failure detected")
+            if self.metrics.checkpoint_action_queue:
+                recovery_action = self._get_recovery_action(batch, intended_action)
+                log_say("Attempting recovery")
+                if self.config.enable_failure_handling:
+                    return recovery_action
 
         return intended_action
 
