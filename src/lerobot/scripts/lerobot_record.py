@@ -569,6 +569,8 @@ def record_loop(
 
     timestamp = 0
     start_episode_t = time.perf_counter()
+    recovery_end_time = 0.0
+    last_action_values = None
     while timestamp < control_time_s:
         start_loop_t = time.perf_counter()
 
@@ -585,64 +587,74 @@ def record_loop(
         if policy is not None or dataset is not None:
             observation_frame = build_dataset_frame(dataset.features, obs_processed, prefix=OBS_STR)
 
-        # Get action from either policy or teleop
-        if policy is not None and preprocessor is not None and postprocessor is not None:
-            action_values = predict_action(
-                observation=observation_frame,
-                policy=policy,
-                device=get_safe_torch_device(policy.config.device),
-                preprocessor=preprocessor,
-                postprocessor=postprocessor,
-                use_amp=policy.config.use_amp,
-                task=single_task,
-                robot_type=robot.robot_type,
-            )
+        is_recovering = time.perf_counter() < recovery_end_time
 
-            act_processed_policy: RobotAction = make_robot_action(action_values, dataset.features)
-
-        elif policy is None and isinstance(teleop, Teleoperator):
-            act = teleop.get_action()
-
-            # Applies a pipeline to the raw teleop action, default is IdentityProcessor
-            act_processed_teleop = teleop_action_processor((act, obs))
-
-        elif policy is None and isinstance(teleop, list):
-            arm_action = teleop_arm.get_action()
-            arm_action = {f"arm_{k}": v for k, v in arm_action.items()}
-            keyboard_action = teleop_keyboard.get_action()
-            base_action = robot._from_keyboard_to_base_action(keyboard_action)
-            act = {**arm_action, **base_action} if len(base_action) > 0 else arm_action
-            act_processed_teleop = teleop_action_processor((act, obs))
+        if is_recovering:
+            # Keep writing frames during recovery while skipping inference and send_action.
+            action_values = last_action_values
         else:
-            continue
+            act_processed_policy = None
 
-        # Applies a pipeline to the action, default is IdentityProcessor
-        if policy is not None and act_processed_policy is not None:
-            action_values = act_processed_policy
-            robot_action_to_send = robot_action_processor((act_processed_policy, obs))
-        else:
-            action_values = act_processed_teleop
-            robot_action_to_send = robot_action_processor((act_processed_teleop, obs))
+            # Get action from either policy or teleop
+            if policy is not None and preprocessor is not None and postprocessor is not None:
+                action_values = predict_action(
+                    observation=observation_frame,
+                    policy=policy,
+                    device=get_safe_torch_device(policy.config.device),
+                    preprocessor=preprocessor,
+                    postprocessor=postprocessor,
+                    use_amp=policy.config.use_amp,
+                    task=single_task,
+                    robot_type=robot.robot_type,
+                )
 
-        # Send action to robot
-        # Action can eventually be clipped using `max_relative_target`,
-        # so action actually sent is saved in the dataset. action = postprocessor.process(action)
-        # TODO(steven, pepijn, adil): we should use a pipeline step to clip the action, so the sent action is the action that we input to the robot.
-        _sent_action = robot.send_action(robot_action_to_send)
+                act_processed_policy: RobotAction = make_robot_action(action_values, dataset.features)
+
+            elif policy is None and isinstance(teleop, Teleoperator):
+                act = teleop.get_action()
+
+                # Applies a pipeline to the raw teleop action, default is IdentityProcessor
+                act_processed_teleop = teleop_action_processor((act, obs))
+
+            elif policy is None and isinstance(teleop, list):
+                arm_action = teleop_arm.get_action()
+                arm_action = {f"arm_{k}": v for k, v in arm_action.items()}
+                keyboard_action = teleop_keyboard.get_action()
+                base_action = robot._from_keyboard_to_base_action(keyboard_action)
+                act = {**arm_action, **base_action} if len(base_action) > 0 else arm_action
+                act_processed_teleop = teleop_action_processor((act, obs))
+            else:
+                continue
+
+            # Applies a pipeline to the action, default is IdentityProcessor
+            if policy is not None and act_processed_policy is not None:
+                action_values = act_processed_policy
+                robot_action_to_send = robot_action_processor((act_processed_policy, obs))
+            else:
+                action_values = act_processed_teleop
+                robot_action_to_send = robot_action_processor((act_processed_teleop, obs))
+
+            last_action_values = action_values
+
+            # Send action to robot
+            # Action can eventually be clipped using `max_relative_target`,
+            # so action actually sent is saved in the dataset. action = postprocessor.process(action)
+            # TODO(steven, pepijn, adil): we should use a pipeline step to clip the action, so the sent action is the action that we input to the robot.
+            _sent_action = robot.send_action(robot_action_to_send)
 
         if policy is not None:
             failure_postprocessor = policy._failure_postprocessor
             if failure_postprocessor.recovery_pending_wait:
-                time.sleep(3.0)
+                recovery_end_time = time.perf_counter() + 3.0
                 failure_postprocessor.recovery_pending_wait = False
 
         # Write to dataset
-        if dataset is not None:
+        if dataset is not None and action_values is not None:
             action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)
             frame = {**observation_frame, **action_frame, "task": single_task}
             dataset.add_frame(frame)
 
-        if display_data:
+        if display_data and action_values is not None:
             log_rerun_data(
                 observation=obs_processed, action=action_values, compress_images=display_compressed_images
             )
