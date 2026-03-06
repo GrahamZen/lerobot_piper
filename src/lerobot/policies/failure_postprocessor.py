@@ -142,7 +142,7 @@ class FailurePostprocessor:
             batch=batch,
             checkpoint_queue=list(self.metrics.checkpoint_action_queue),
             episode=self.metrics.episode,
-            step=self.metrics.process_step,
+            step=max(0, self.metrics.process_step - 1),
         )
 
         if selected_index is None or not (0 <= selected_index < len(self.metrics.checkpoint_action_queue)):

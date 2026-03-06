@@ -159,27 +159,58 @@ def _load_vlm_message_records(dataset_root: Path) -> list[dict]:
     return records
 
 
-def _select_vlm_record_for_step(vlm_records: list[dict], episode_idx: int, local_step: int):
+def _select_vlm_record_for_step(vlm_records: list[dict], episode_idx: int, step: int, max_step_gap: int = 3):
     if not vlm_records:
         return None
 
     episode_candidates = {episode_idx, episode_idx + 1}
 
-    exact = [r for r in vlm_records if r.get("episode") in episode_candidates and r.get("step") == local_step]
+    def _in_episode_candidates(record: dict) -> bool:
+        ep = record.get("episode")
+        return ep in episode_candidates if isinstance(ep, int) else False
+
+    records_in_episode = [r for r in vlm_records if _in_episode_candidates(r)]
+
+    exact = [r for r in records_in_episode if r.get("step") == step]
     if exact:
         return exact[-1]
 
-    candidates = []
-    for r in vlm_records:
-        if r.get("episode") not in episode_candidates:
-            continue
+    # In practice VLM record `step` can lag/lead failure trigger by 1-2 steps.
+    # Use nearest record within a small tolerance to keep panels aligned with failure events.
+    nearby: list[dict] = []
+    for r in records_in_episode:
         step_value = r.get("step")
         if not isinstance(step_value, int):
             continue
-        if step_value <= local_step:
+        if abs(step_value - step) <= max_step_gap:
+            nearby.append(r)
+    if nearby:
+        selected = sorted(
+            nearby,
+            key=lambda x: (abs(x.get("step", 10**9) - step), -int(x.get("record_index", -1))),
+        )[0]
+        selected_step = selected.get("step")
+        if selected_step != step:
+            print(
+                f"[WARN] VLM record fuzzy match: failure at step {step}, but matched VLM record at step {selected_step}"
+            )
+        return selected
+
+    candidates = []
+    for r in records_in_episode:
+        step_value = r.get("step")
+        if not isinstance(step_value, int):
+            continue
+        if step_value <= step and (step - step_value) <= max_step_gap:
             candidates.append(r)
     if candidates:
-        return sorted(candidates, key=lambda x: (x.get("step"), x.get("record_index", -1)))[-1]
+        selected = sorted(candidates, key=lambda x: (x.get("step"), x.get("record_index", -1)))[-1]
+        selected_step = selected.get("step")
+        if selected_step != step:
+            print(
+                f"[WARN] VLM record fuzzy match: failure at step {step}, but matched VLM record at step {selected_step}"
+            )
+        return selected
 
     return None
 
@@ -317,88 +348,6 @@ def save_timing_curves_plot(
     return timing_plot_file
 
 
-# =====================================================================
-# Updated module: includes Mahalanobis distance computation
-# =====================================================================
-def build_advanced_fusion_metrics(
-    failure_metrics, smoothed_td_by_step, window_size=20, dataset_episodes=None, mahal_cfg=None
-):
-    if not failure_metrics:
-        return {}
-
-    steps = sorted(failure_metrics.keys())
-    entropies = np.array([float(failure_metrics[step].get("attention_entropy", 0.0)) for step in steps])
-
-    step_to_episode = {}
-    if dataset_episodes is not None:
-        for ep_meta in dataset_episodes:
-            from_idx = int(
-                ep_meta["dataset_from_index"]
-                if not isinstance(ep_meta["dataset_from_index"], list)
-                else ep_meta["dataset_from_index"][0]
-            )
-            to_idx = int(
-                ep_meta["dataset_to_index"]
-                if not isinstance(ep_meta["dataset_to_index"], list)
-                else ep_meta["dataset_to_index"][0]
-            )
-            for step in range(from_idx, to_idx):
-                step_to_episode[step] = (from_idx, to_idx)
-
-    # 1. Compute local variance
-    variances = np.zeros_like(entropies)
-    for i, step in enumerate(steps):
-        ep_bounds = step_to_episode.get(step)
-        from_idx = ep_bounds[0] if ep_bounds else 0
-
-        start_idx = i
-        while start_idx > 0 and start_idx > i - window_size and steps[start_idx - 1] >= from_idx:
-            start_idx -= 1
-
-        full_window = entropies[start_idx : i + 1]
-        if len(full_window) > 3:
-            variances[i] = np.var(full_window)
-
-    # Extract Mahalanobis distance configuration
-    mu = None
-    inv_cov = None
-    if mahal_cfg and "mu" in mahal_cfg and "inv_cov" in mahal_cfg:
-        mu = np.array(mahal_cfg["mu"])
-        inv_cov = np.array(mahal_cfg["inv_cov"])
-
-    advanced_metrics = {}
-    for i, step in enumerate(steps):
-        var_val = float(variances[i])
-        td_val = smoothed_td_by_step.get(step, 0.0)
-
-        # Use raw TD for Mahalanobis distance (aligned with the threshold calculation script)
-        raw_td = float(failure_metrics[step].get("temporal_disagreement", 0.0))
-
-        # Compute Mahalanobis distance for the fused score
-        mahal_dist = 0.0
-        if mu is not None and inv_cov is not None:
-            # Build the 2D feature vector X for the current step
-            x_t = np.array([raw_td, var_val])
-            diff = x_t - mu
-            # Formula: sqrt((X - mu)^T * Sigma^{-1} * (X - mu))
-            left = np.dot(diff, inv_cov)
-            mahal_dist = np.sqrt(np.abs(np.dot(left, diff)))
-
-        # Keep the original weighted version for comparison
-        alpha_scale = 20.0
-        fusion_score = td_val + (alpha_scale * var_val)
-
-        advanced_metrics[step] = {
-            "local_variance": var_val,
-            "fusion_sum": fusion_score,
-            "mahalanobis_dist": float(mahal_dist),
-        }
-    return advanced_metrics
-
-
-# =====================================================================
-
-
 def visualize_dataset(
     repo_id,
     root=None,
@@ -444,13 +393,10 @@ def visualize_dataset(
     smoothed_td_by_step = {}
     previous_checkpoint_by_step = {}
     checkpoint_flag_by_step = {}
+    detect_failure_by_step = {}
 
     td_failed_steps = []
     td_failed_step_set = set()
-    mahal_failed_step_set = set()
-
-    mahal_cfg = {}
-    advanced_metrics = {}
 
     # Load required config from model's failure_handling.json (raises error if not found)
     failure_handling_cfg = load_failure_handling_json(dataset.root, required=True)
@@ -476,12 +422,6 @@ def visualize_dataset(
 
     td_cp_threshold = float(td_cp_threshold)
     print(f"Loaded cp_threshold from failure_handling.json: {td_cp_threshold:.6f}")
-
-    # Extract Mahalanobis config if present
-    mahal_cp_threshold = None
-    if "fusion_mahalanobis" in metrics_cfg:
-        mahal_cfg = metrics_cfg["fusion_mahalanobis"]
-        mahal_cp_threshold = mahal_cfg.get("cp_threshold")
 
     # safety_margin is optional (visualization-only parameter)
     safety_margin = td_config.get("safety_margin", DEFAULT_SAFETY_MARGIN)
@@ -537,6 +477,7 @@ def visualize_dataset(
             previous_checkpoint_by_step,
             checkpoint_flag_by_step,
             recent_checkpoints_by_step,
+            detect_failure_by_step,
         ) = replay_checkpoint_series(
             failure_metrics,
             failure_cfg,
@@ -544,30 +485,12 @@ def visualize_dataset(
             dataset_episodes=dataset.meta.episodes,
         )
 
-        # Step 2: pass TD in and compute Mahalanobis-based fused features
-        advanced_metrics = build_advanced_fusion_metrics(
-            failure_metrics,
-            smoothed_td_by_step,
-            window_size=20,
-            dataset_episodes=dataset.meta.episodes,
-            mahal_cfg=mahal_cfg,
-        )
-
-        # Step 3: identify red markers based on thresholds
-        if mahal_cp_threshold is None:
-            mahal_cp_threshold = float("inf")
-
+        # Identify red markers based on FailureMetrics.detect_failure()
         for step in sorted(failure_metrics.keys()):
-            raw_td = float(failure_metrics[step].get("temporal_disagreement", 0.0))
-            smooth_td = float(smoothed_td_by_step.get(step, raw_td))
-
-            # TD decision (align with online detect_failure using smoothed signal)
-            if smooth_td > td_cp_threshold:
+            # TD decision must exactly follow FailureMetrics.detect_failure()
+            if detect_failure_by_step.get(step, False):
                 td_failed_steps.append(step)
                 td_failed_step_set.add(step)
-            # Mahalanobis-distance decision
-            if advanced_metrics[step].get("mahalanobis_dist", 0.0) > mahal_cp_threshold:
-                mahal_failed_step_set.add(step)
 
     camera_names = [key.replace("observation.images.", "") for key in dataset.meta.camera_keys]
 
@@ -579,24 +502,32 @@ def visualize_dataset(
         )
 
         if use_vlm_panels:
-            pair_views = [
-                rrb.Horizontal(
-                    rrb.TextDocumentView(
-                        name=f"Window 3.{idx} - Request Pair Text",
-                        origin=f"vlm_message/pairs/{idx}/text",
-                    ),
-                    rrb.Spatial2DView(
-                        name=f"Window 3.{idx} - Request Pair Image",
-                        origin=f"vlm_message/pairs/{idx}/image",
-                    ),
-                    column_shares=[1, 1],
+            # Create text views (left column)
+            text_views = [
+                rrb.TextDocumentView(
+                    name=f"Window 3.{idx} - Request Pair Text",
+                    origin=f"vlm_message/pairs/{idx}/text",
                 )
                 for idx in range(MAX_VLM_PAIR_SLOTS)
             ]
+            # Create image views (right column)
+            image_views = [
+                rrb.Spatial2DView(
+                    name=f"Window 3.{idx} - Request Pair Image",
+                    origin=f"vlm_message/pairs/{idx}/image",
+                )
+                for idx in range(MAX_VLM_PAIR_SLOTS)
+            ]
+
             middle_right_panel = rrb.Vertical(
                 rrb.TextDocumentView(name="Window 1 - Message Metadata", origin="vlm_message/metadata"),
-                *pair_views,
+                rrb.Horizontal(
+                    rrb.Vertical(*text_views),
+                    rrb.Vertical(*image_views),
+                    column_shares=[1, 1],
+                ),
                 rrb.TextDocumentView(name="Window 4 - VLM Response", origin="vlm_message/response"),
+                row_shares=[0.5, 6, 1],
             )
         else:
             middle_right_panel = rrb.Vertical(
@@ -615,14 +546,6 @@ def visualize_dataset(
                             name="Temporal Disagreement", origin="metrics/temporal_disagreement"
                         ),
                         rrb.TimeSeriesView(
-                            name="[ADV] Attention Local Variance", origin="metrics/attention_local_variance"
-                        ),
-                        # --- Core new panel: Mahalanobis distance and its failure markers ---
-                        rrb.TimeSeriesView(
-                            name="[ULTIMATE] Mahalanobis Fusion Dist",
-                            origin="metrics/mahalanobis_fusion_dist",
-                        ),
-                        rrb.TimeSeriesView(
                             name="Temporal Disagreement Smoothed",
                             origin="metrics/temporal_disagreement_smoothed",
                         ),
@@ -631,21 +554,22 @@ def visualize_dataset(
                             name="Previous Checkpoint Step", origin="metrics/previous_checkpoint_step"
                         ),
                         rrb.TimeSeriesView(name="Attention Entropy", origin="metrics/attention_entropy"),
-                        rrb.TimeSeriesView(
-                            name="Mahalanobis Distance", origin="metrics/mahalanobis_distance"
-                        ),
+                        # rrb.TimeSeriesView(
+                        #     name="Mahalanobis Distance", origin="metrics/mahalanobis_distance"
+                        # ),
                         rrb.TimeSeriesView(name="Endpoint Shift", origin="metrics/endpoint_shift"),
                         rrb.TimeSeriesView(name="Action Jerk", origin="metrics/action_jerk"),
-                        rrb.TimeSeriesView(
-                            name="Attention Entropy Downward Slope",
-                            origin="metrics/attention_entropy_downward_slope",
-                        ),
+                        # rrb.TimeSeriesView(
+                        #     name="Attention Entropy Downward Slope",
+                        #     origin="metrics/attention_entropy_downward_slope",
+                        # ),
                         rrb.TimeSeriesView(name="Checkpoint Flag", origin="metrics/checkpoint_flag"),
                     ),
                     middle_right_panel,
+                    column_shares=[1, 1],
                 ),
                 rrb.Vertical(*camera_views, id_overlay_view, row_shares=[6] * len(camera_views) + [1]),
-                column_shares=[2, 1],
+                column_shares=[4, 1],
             ),
             collapse_panels=True,
         )
@@ -661,9 +585,7 @@ def visualize_dataset(
         metric_names = [
             "temporal_disagreement",
             "temporal_disagreement_smoothed",
-            "mahalanobis_fusion_dist",
             "previous_checkpoint_step",
-            "attention_local_variance",
             "following_error",
             "attention_entropy",
             "attention_entropy_downward_slope",
@@ -732,14 +654,6 @@ def visualize_dataset(
                 rr.log("metrics/temporal_disagreement", rr.Scalars(raw_td))
                 rr.log("metrics/temporal_disagreement_smoothed", rr.Scalars(smooth_td))
 
-                adv = advanced_metrics.get(
-                    i, {"local_variance": 0.0, "fusion_sum": 0.0, "mahalanobis_dist": 0.0}
-                )
-                rr.log("metrics/attention_local_variance", rr.Scalars(adv["local_variance"]))
-
-                # --- Log Mahalanobis distance and its detected red markers ---
-                rr.log("metrics/mahalanobis_fusion_dist", rr.Scalars(adv["mahalanobis_dist"]))
-
                 rr.log("metrics/following_error", rr.Scalars(m.get("following_error", 0.0)))
                 attention_entropy = float(m.get("attention_entropy", 0.0))
                 rr.log("metrics/attention_entropy", rr.Scalars(attention_entropy))
@@ -766,20 +680,14 @@ def visualize_dataset(
                 )
                 rr.log("metrics/checkpoint_flag", rr.Scalars(checkpoint_flag_by_step.get(i, 0.0)))
 
-                # Log red failure markers for all metrics at failed time points
-                is_failed = i in td_failed_step_set or i in mahal_failed_step_set
-                if is_failed:
+                # Log red failure markers only when TD failure is detected (smoothed_td > cp_threshold)
+                is_td_failed = i in td_failed_step_set
+                if is_td_failed:
                     rr.log("metrics/temporal_disagreement/failed_markers", rr.Scalars(raw_td))
                     rr.log("metrics/temporal_disagreement_smoothed/failed_markers", rr.Scalars(smooth_td))
                     rr.log(
                         "metrics/previous_checkpoint_step/failed_markers",
                         rr.Scalars(previous_checkpoint_by_step.get(i, np.nan)),
-                    )
-                    rr.log(
-                        "metrics/mahalanobis_fusion_dist/failed_markers", rr.Scalars(adv["mahalanobis_dist"])
-                    )
-                    rr.log(
-                        "metrics/attention_local_variance/failed_markers", rr.Scalars(adv["local_variance"])
                     )
                     rr.log(
                         "metrics/following_error/failed_markers", rr.Scalars(m.get("following_error", 0.0))
@@ -801,14 +709,13 @@ def visualize_dataset(
                     )
 
                 if use_vlm_panels:
-                    local_step = i - from_idx
-                    matched_record = _select_vlm_record_for_step(vlm_records, episode_idx, local_step)
-                    if is_failed:
+                    matched_record = _select_vlm_record_for_step(vlm_records, episode_idx, i)
+                    if is_td_failed:
                         _log_vlm_record_windows(matched_record)
                     else:
                         _log_vlm_record_windows(None)
                 else:
-                    if is_failed:
+                    if is_td_failed:
                         _log_checkpoint_windows(dataset, recent_checkpoints_by_step, i)
                     else:
                         for cp_idx in range(5):

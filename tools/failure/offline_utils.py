@@ -190,9 +190,9 @@ def replay_checkpoint_series(
     *,
     safety_margin: int = 40,
     dataset_episodes: list[dict[str, Any]] | None = None,
-) -> tuple[dict[int, float], dict[int, float], dict[int, float], dict[int, list[int]]]:
+) -> tuple[dict[int, float], dict[int, float], dict[int, float], dict[int, list[int]], dict[int, bool]]:
     if not failure_metrics:
-        return {}, {}, {}, {}
+        return {}, {}, {}, {}, {}
 
     replay_cfg = deepcopy(config)
     replay_cfg.enable_failure_handling = True
@@ -203,6 +203,7 @@ def replay_checkpoint_series(
     previous_checkpoint_by_step: dict[int, float] = {}
     checkpoint_flag_by_step: dict[int, float] = {}
     recent_checkpoints_by_step: dict[int, list[int]] = {}
+    detect_failure_by_step: dict[int, bool] = {}
 
     checkpoint_set: set[int] = set()
     checkpoint_history: list[int] = []
@@ -242,6 +243,7 @@ def replay_checkpoint_series(
         metrics_engine.process_step = int(step)
         metrics_engine.latest_temporal_disagreement = disagreement
         metrics_engine.append_state(torch.zeros(1, dtype=torch.float32), batch=None)
+        detect_failure_by_step[int(step)] = bool(metrics_engine.detect_failure())
 
         smoothed_by_step[int(step)] = float(metrics_engine.latest_smoothed_disagreement)
 
@@ -269,4 +271,5 @@ def replay_checkpoint_series(
         previous_checkpoint_by_step,
         checkpoint_flag_by_step,
         recent_checkpoints_by_step,
+        detect_failure_by_step,
     )
