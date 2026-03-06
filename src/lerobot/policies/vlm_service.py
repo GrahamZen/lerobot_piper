@@ -375,6 +375,7 @@ class VLMService:
                 "episode": record.get("episode"),
                 "step": record.get("step"),
                 "selected_index": record.get("selected_index"),
+                "selected_step": record.get("selected_step"),
                 "error": record.get("error"),
                 "request_part_count": len(request_parts),
                 "request_parts": part_items,
@@ -407,11 +408,13 @@ class VLMService:
         return self.debug_session_path
 
     def _parse_selected_index(self, reply: str, checkpoint_indices: list[int]) -> int:
-        final_answer_match = re.search(
+        # Prefer the last tagged answer, because the model may echo earlier examples
+        # like "<FINAL_ANSWER>3</FINAL_ANSWER>" before its real final choice.
+        final_answer_matches = re.findall(
             r"<FINAL_ANSWER>\s*(-?\d+)\s*</FINAL_ANSWER>", reply, flags=re.IGNORECASE
         )
-        if final_answer_match:
-            selected_index = int(final_answer_match.group(1))
+        if final_answer_matches:
+            selected_index = int(final_answer_matches[-1])
             parse_source = "final_answer_tag"
         else:
             first_line = reply.split("\n", 1)[0] if reply else ""
@@ -478,6 +481,13 @@ class VLMService:
 
         checkpoint_indices = list(range(len(checkpoint_queue)))
         self.logger.info("[VLMService.select_checkpoint_index] Candidate indices=%s", checkpoint_indices)
+        candidate_step_map = {
+            idx: (entry[0] if len(entry) > 0 else "unknown") for idx, entry in enumerate(checkpoint_queue)
+        }
+        self.logger.info(
+            "[VLMService.select_checkpoint_index] Candidate step map=%s",
+            candidate_step_map,
+        )
 
         message_contents, valid_candidate_indices = self._build_message_contents(
             batch=batch,
@@ -535,8 +545,14 @@ class VLMService:
 
             selected_index = self._parse_selected_index(reply, valid_candidate_indices)
             debug_record["selected_index"] = selected_index
+            selected_step = candidate_step_map.get(selected_index, "unknown")
+            debug_record["selected_step"] = selected_step
 
-            self.logger.info("[VLMService.select_checkpoint_index] Final selected_index=%d", selected_index)
+            self.logger.info(
+                "[VLMService.select_checkpoint_index] Final selected_index=%d | selected_step=%s",
+                selected_index,
+                selected_step,
+            )
             return selected_index
 
         except Exception as e:
