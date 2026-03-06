@@ -449,32 +449,70 @@ def visualize_dataset(
     td_failed_step_set = set()
     mahal_failed_step_set = set()
 
-    td_cp_threshold = None
-    mahal_cp_threshold = None
     mahal_cfg = {}
     advanced_metrics = {}
 
-    failure_handling_cfg = load_failure_handling_json(dataset.root)
-    failure_cfg = load_failure_config(dataset.root)
+    # Load required config from model's failure_handling.json (raises error if not found)
+    failure_handling_cfg = load_failure_handling_json(dataset.root, required=True)
+    failure_cfg = load_failure_config(dataset.root, required=True)
 
-    if "metrics" in failure_handling_cfg:
-        metrics_cfg = failure_handling_cfg["metrics"]
-        if "temporal_disagreement" in metrics_cfg:
-            td_cp_threshold = metrics_cfg["temporal_disagreement"].get("cp_threshold")
-        if "fusion_mahalanobis" in metrics_cfg:
-            mahal_cfg = metrics_cfg["fusion_mahalanobis"]
-            mahal_cp_threshold = mahal_cfg.get("cp_threshold")
+    if (
+        "metrics" not in failure_handling_cfg
+        or "temporal_disagreement" not in failure_handling_cfg["metrics"]
+    ):
+        raise ValueError(
+            "ERROR: failure_handling.json must contain 'metrics' -> 'temporal_disagreement' section"
+        )
 
-    # Backward compatibility (if still stored at top level)
-    if td_cp_threshold is None and "cp_threshold" in failure_handling_cfg:
-        td_cp_threshold = failure_handling_cfg.get("cp_threshold")
+    metrics_cfg = failure_handling_cfg["metrics"]
+    td_config = metrics_cfg["temporal_disagreement"]
 
+    # Extract required cp_threshold
+    td_cp_threshold = td_config.get("cp_threshold")
     if td_cp_threshold is None:
-        td_cp_threshold = float(failure_cfg.metrics.temporal_disagreement.cp_threshold)
+        raise ValueError(
+            "ERROR: 'cp_threshold' not found in failure_handling.json temporal_disagreement config"
+        )
 
-    safety_margin = DEFAULT_SAFETY_MARGIN
+    td_cp_threshold = float(td_cp_threshold)
+    print(f"Loaded cp_threshold from failure_handling.json: {td_cp_threshold:.6f}")
+
+    # Extract Mahalanobis config if present
+    mahal_cp_threshold = None
+    if "fusion_mahalanobis" in metrics_cfg:
+        mahal_cfg = metrics_cfg["fusion_mahalanobis"]
+        mahal_cp_threshold = mahal_cfg.get("cp_threshold")
+
+    # safety_margin is optional (visualization-only parameter)
+    safety_margin = td_config.get("safety_margin", DEFAULT_SAFETY_MARGIN)
+
+    # Ensure failure_cfg uses the correct values from JSON (not defaults)
+    # The FailureConfig object may use defaults due to schema validation issues
+    td_cfg = failure_cfg.metrics.temporal_disagreement
+    td_cfg.window_size = int(td_config.get("window_size", td_cfg.window_size))
+    td_cfg.eval_delay = int(td_config.get("eval_delay", td_cfg.eval_delay))
+    td_cfg.valley_lookback = int(td_config.get("valley_lookback", td_cfg.valley_lookback))
+    td_cfg.valley_lookahead = int(td_config.get("valley_lookahead", td_cfg.valley_lookahead))
+    td_cfg.smoothing_sigma = float(td_config.get("smoothing_sigma", td_cfg.smoothing_sigma))
+    valley_prominence_json = td_config.get("valley_prominence", td_cfg.valley_prominence)
+    td_cfg.valley_prominence = (
+        td_cfg.valley_prominence if valley_prominence_json is None else float(valley_prominence_json)
+    )
+    td_cfg.cp_threshold = td_cp_threshold
+    td_cfg.__post_init__()
+
+    print("Using checkpoint detection parameters:")
+    print(f"  window_size: {td_cfg.window_size}")
+    print(f"  eval_delay: {td_cfg.eval_delay}")
+    print(f"  valley_lookback: {td_cfg.valley_lookback}")
+    print(f"  valley_lookahead: {td_cfg.valley_lookahead}")
+    print(f"  smoothing_sigma: {td_cfg.smoothing_sigma}")
+    print(f"  valley_prominence: {td_cfg.valley_prominence}")
+    print(f"  safety_margin: {safety_margin}")
+
+    # Allow command-line override of parameters
     if checkpoint_signal_config:
-        td_cfg = failure_cfg.metrics.temporal_disagreement
+        print("Applying command-line overrides:")
         td_cfg.window_size = int(checkpoint_signal_config.get("window_size", td_cfg.window_size))
         td_cfg.eval_delay = int(checkpoint_signal_config.get("eval_delay", td_cfg.eval_delay))
         td_cfg.valley_lookback = int(checkpoint_signal_config.get("valley_lookback", td_cfg.valley_lookback))
@@ -489,7 +527,9 @@ def visualize_dataset(
             td_cfg.valley_prominence if valley_prominence is None else float(valley_prominence)
         )
         td_cfg.__post_init__()
-        safety_margin = int(checkpoint_signal_config.get("safety_margin", DEFAULT_SAFETY_MARGIN))
+        safety_margin = int(checkpoint_signal_config.get("safety_margin", safety_margin))
+        print(f"  smoothing_sigma: {td_cfg.smoothing_sigma}")
+        print(f"  valley_prominence: {td_cfg.valley_prominence}")
 
     if failure_metrics:
         (
@@ -616,29 +656,28 @@ def visualize_dataset(
     if blueprint:
         rr.send_blueprint(blueprint)
 
-    # Register static marker styles in Rerun
+    # Register static marker styles in Rerun for all metrics
     if failure_metrics:
-        rr.log(
-            "metrics/temporal_disagreement/failed_markers",
-            rr.SeriesPoints(colors=[255, 0, 0], markers="circle", marker_sizes=6.0),
-            static=True,
-        )
-        rr.log(
-            "metrics/temporal_disagreement_smoothed/failed_markers",
-            rr.SeriesPoints(colors=[255, 0, 0], markers="circle", marker_sizes=6.0),
-            static=True,
-        )
-        # Register red markers for Mahalanobis distance
-        rr.log(
-            "metrics/mahalanobis_fusion_dist/failed_markers",
-            rr.SeriesPoints(colors=[255, 0, 0], markers="circle", marker_sizes=6.0),
-            static=True,
-        )
-        rr.log(
-            "metrics/previous_checkpoint_step/failed_markers",
-            rr.SeriesPoints(colors=[255, 0, 0], markers="circle", marker_sizes=6.0),
-            static=True,
-        )
+        metric_names = [
+            "temporal_disagreement",
+            "temporal_disagreement_smoothed",
+            "mahalanobis_fusion_dist",
+            "previous_checkpoint_step",
+            "attention_local_variance",
+            "following_error",
+            "attention_entropy",
+            "attention_entropy_downward_slope",
+            "mahalanobis_distance",
+            "endpoint_shift",
+            "action_jerk",
+            "checkpoint_flag",
+        ]
+        for metric_name in metric_names:
+            rr.log(
+                f"metrics/{metric_name}/failed_markers",
+                rr.SeriesPoints(colors=[255, 0, 0], markers="circle", marker_sizes=6.0),
+                static=True,
+            )
 
     global_step = 0
     prev_attention_entropy = None
@@ -727,19 +766,40 @@ def visualize_dataset(
                 )
                 rr.log("metrics/checkpoint_flag", rr.Scalars(checkpoint_flag_by_step.get(i, 0.0)))
 
-                if i in td_failed_step_set:
+                # Log red failure markers for all metrics at failed time points
+                is_failed = i in td_failed_step_set or i in mahal_failed_step_set
+                if is_failed:
                     rr.log("metrics/temporal_disagreement/failed_markers", rr.Scalars(raw_td))
                     rr.log("metrics/temporal_disagreement_smoothed/failed_markers", rr.Scalars(smooth_td))
                     rr.log(
                         "metrics/previous_checkpoint_step/failed_markers",
                         rr.Scalars(previous_checkpoint_by_step.get(i, np.nan)),
                     )
-                if i in mahal_failed_step_set:
                     rr.log(
                         "metrics/mahalanobis_fusion_dist/failed_markers", rr.Scalars(adv["mahalanobis_dist"])
                     )
+                    rr.log(
+                        "metrics/attention_local_variance/failed_markers", rr.Scalars(adv["local_variance"])
+                    )
+                    rr.log(
+                        "metrics/following_error/failed_markers", rr.Scalars(m.get("following_error", 0.0))
+                    )
+                    rr.log("metrics/attention_entropy/failed_markers", rr.Scalars(attention_entropy))
+                    rr.log(
+                        "metrics/attention_entropy_downward_slope/failed_markers",
+                        rr.Scalars(attention_entropy_downward_slope),
+                    )
+                    rr.log(
+                        "metrics/mahalanobis_distance/failed_markers",
+                        rr.Scalars(m.get("mahalanobis_distance", 0.0)),
+                    )
+                    rr.log("metrics/endpoint_shift/failed_markers", rr.Scalars(m.get("endpoint_shift", 0.0)))
+                    rr.log("metrics/action_jerk/failed_markers", rr.Scalars(m.get("action_jerk", 0.0)))
+                    rr.log(
+                        "metrics/checkpoint_flag/failed_markers",
+                        rr.Scalars(checkpoint_flag_by_step.get(i, 0.0)),
+                    )
 
-                is_failed = i in td_failed_step_set or i in mahal_failed_step_set
                 if use_vlm_panels:
                     local_step = i - from_idx
                     matched_record = _select_vlm_record_for_step(vlm_records, episode_idx, local_step)

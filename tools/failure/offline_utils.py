@@ -56,43 +56,114 @@ def _iter_failure_handling_candidates(pretrained_path: Path):
             yield from root.glob(pattern)
 
 
-def resolve_failure_handling_json_path(dataset_root: str | Path) -> Path | None:
+def resolve_failure_handling_json_path(
+    dataset_root: str | Path, raise_on_missing: bool = False
+) -> Path | None:
+    """Resolve the path to failure_handling.json.
+
+    Args:
+        dataset_root: Root directory of the dataset
+        raise_on_missing: If True, raise errors when config files are not found
+
+    Returns:
+        Path to failure_handling.json, or None if not found and raise_on_missing=False
+
+    Raises:
+        FileNotFoundError: If raise_on_missing=True and files are not found
+        RuntimeError: If raise_on_missing=True and parsing fails
+        ValueError: If raise_on_missing=True and pretrained_path is missing
+    """
     dataset_root = Path(dataset_root).expanduser()
     record_config_path = dataset_root / "meta" / "record_config.json"
     if not record_config_path.exists():
+        if raise_on_missing:
+            raise FileNotFoundError(
+                f"ERROR: record_config.json not found at {record_config_path}. "
+                "Cannot load checkpoint signal config."
+            )
         return None
 
     try:
         with open(record_config_path) as file:
             record_config = json.load(file)
-    except Exception:
+    except Exception as e:
+        if raise_on_missing:
+            raise RuntimeError(
+                f"ERROR: Failed to parse record_config.json at {record_config_path}: {e}"
+            ) from e
         return None
 
     pretrained_path = _extract_pretrained_path(record_config)
     if not pretrained_path:
+        if raise_on_missing:
+            raise ValueError(f"ERROR: 'pretrained_path' not found in {record_config_path}")
         return None
 
-    for candidate in _iter_failure_handling_candidates(pretrained_path):
+    candidates = list(_iter_failure_handling_candidates(pretrained_path))
+    for candidate in candidates:
         if candidate.exists():
             return candidate
 
+    if raise_on_missing:
+        tried_paths = "\n".join(f"  - {c}" for c in candidates[:5])
+        raise FileNotFoundError(
+            f"ERROR: failure_handling.json not found. Tried:\n{tried_paths}\n"
+            "This file is required to visualize checkpoint detection and failure metrics."
+        )
     return None
 
 
-def load_failure_handling_json(dataset_root: str | Path) -> dict[str, Any]:
-    cfg_path = resolve_failure_handling_json_path(dataset_root)
+def load_failure_handling_json(dataset_root: str | Path, required: bool = False) -> dict[str, Any]:
+    """Load failure_handling.json from dataset.
+
+    Args:
+        dataset_root: Root directory of the dataset
+        required: If True, raise errors when config file is not found or invalid
+
+    Returns:
+        Dictionary with failure handling configuration
+
+    Raises:
+        FileNotFoundError/RuntimeError/ValueError: If required=True and loading fails
+    """
+    cfg_path = resolve_failure_handling_json_path(dataset_root, raise_on_missing=required)
     if cfg_path is None:
+        if required:
+            raise FileNotFoundError(
+                f"ERROR: Could not resolve failure_handling.json path for dataset {dataset_root}"
+            )
         return {}
 
     try:
         with open(cfg_path) as file:
-            return json.load(file)
-    except Exception:
+            cfg = json.load(file)
+            if required:
+                print(f"Loaded failure handling config from {cfg_path}")
+            return cfg
+    except Exception as e:
+        if required:
+            raise RuntimeError(f"ERROR: Failed to parse failure_handling.json at {cfg_path}: {e}") from e
         return {}
 
 
-def load_failure_config(dataset_root: str | Path) -> FailureConfig:
-    cfg_path = resolve_failure_handling_json_path(dataset_root)
+def load_failure_config(dataset_root: str | Path, required: bool = False) -> FailureConfig:
+    """Load FailureConfig from dataset.
+
+    Args:
+        dataset_root: Root directory of the dataset
+        required: If True, raise errors when config file is not found
+
+    Returns:
+        FailureConfig instance
+
+    Raises:
+        FileNotFoundError/RuntimeError/ValueError: If required=True and loading fails
+    """
+    cfg_path = resolve_failure_handling_json_path(dataset_root, raise_on_missing=required)
+    if cfg_path is None and required:
+        raise FileNotFoundError(
+            f"ERROR: Could not resolve failure_handling.json path for dataset {dataset_root}"
+        )
     return FailureConfig.from_json(cfg_path)
 
 
