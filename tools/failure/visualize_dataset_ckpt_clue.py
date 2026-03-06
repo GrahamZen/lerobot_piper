@@ -14,6 +14,7 @@ Usage:
 """
 
 import argparse
+import json
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -40,6 +41,202 @@ except ModuleNotFoundError:
     )
 
 DEFAULT_SAFETY_MARGIN = 40
+MAX_VLM_PAIR_SLOTS = 6
+_VLM_EMPTY_IMAGE = np.zeros((16, 16, 3), dtype=np.uint8)
+
+
+def _safe_int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _build_vlm_record_view(rec_dir: Path, rec_index: int, meta: dict) -> dict:
+    parts = sorted(meta.get("request_parts", []), key=lambda x: int(x.get("index", 0)))
+
+    sequence_lines = [
+        "Request parts raw sequence (original order):",
+    ]
+    for p in parts:
+        sequence_lines.append(f"- idx={p.get('index')} | type={p.get('type')} | file={p.get('file')}")
+    if not parts:
+        sequence_lines.append("- <empty>")
+
+    response_path = rec_dir / "response.txt"
+    response_text = (
+        response_path.read_text(encoding="utf-8") if response_path.exists() else "<No response.txt>"
+    )
+
+    def _read_part_text(part: dict) -> str:
+        p_file = part.get("file")
+        p_path = rec_dir / p_file if p_file else rec_dir / ""
+        p_text = p_path.read_text(encoding="utf-8") if p_file and p_path.exists() else f"[Missing] {p_file}"
+        return f"[part {part.get('index')}] {p_file}\n{p_text}"
+
+    def _read_part_image(part: dict) -> np.ndarray:
+        p_file = part.get("file")
+        p_path = rec_dir / p_file if p_file else rec_dir / ""
+        if p_file and p_path.exists():
+            img = Image.open(p_path).convert("RGB")
+            return np.asarray(img)
+        return _VLM_EMPTY_IMAGE.copy()
+
+    pair_rows: list[dict] = []
+    i = 0
+    while i < len(parts):
+        part = parts[i]
+        part_type = part.get("type")
+
+        if part_type == "text":
+            row_text = _read_part_text(part)
+            row_image = _VLM_EMPTY_IMAGE.copy()
+            if i + 1 < len(parts) and parts[i + 1].get("type") == "image":
+                row_image = _read_part_image(parts[i + 1])
+                i += 2
+            else:
+                i += 1
+            pair_rows.append({"text": row_text, "image": row_image})
+            continue
+
+        if part_type == "image":
+            row_text = f"[no paired text]\n[part {part.get('index')}] {part.get('file')}"
+            row_image = _read_part_image(part)
+            pair_rows.append({"text": row_text, "image": row_image})
+            i += 1
+            continue
+
+        i += 1
+
+    if not pair_rows:
+        pair_rows.append({"text": "<No request parts>", "image": _VLM_EMPTY_IMAGE.copy()})
+
+    header = (
+        f"record #{rec_index} | episode={meta.get('episode')} | step={meta.get('step')} "
+        f"| selected_index={meta.get('selected_index')} | selected_step={meta.get('selected_step')}"
+    )
+
+    return {
+        "episode": _safe_int(meta.get("episode")),
+        "step": _safe_int(meta.get("step")),
+        "record_index": rec_index,
+        "header": header,
+        "sequence_text": "\n".join(sequence_lines),
+        "pair_rows": pair_rows,
+        "response_text": response_text,
+    }
+
+
+def _load_vlm_message_records(dataset_root: Path) -> list[dict]:
+    debug_root = dataset_root / "vlm" / "debug_records"
+    if not debug_root.exists():
+        return []
+
+    session_dirs = sorted([p for p in debug_root.iterdir() if p.is_dir()])
+    records: list[dict] = []
+    for session_dir in session_dirs:
+        manifest_path = session_dir / "manifest.json"
+        if not manifest_path.exists():
+            continue
+
+        with manifest_path.open("r", encoding="utf-8") as f:
+            manifest = json.load(f)
+
+        for rec in sorted(manifest.get("records", []), key=lambda x: int(x.get("index", 0))):
+            rec_index = int(rec.get("index", 0))
+            rec_dir = session_dir / rec.get("dir", "")
+            meta_path = rec_dir / "meta.json"
+            if not meta_path.exists():
+                continue
+
+            with meta_path.open("r", encoding="utf-8") as f:
+                meta = json.load(f)
+
+            record_view = _build_vlm_record_view(rec_dir, rec_index, meta)
+            record_view["session_dir"] = str(session_dir)
+            records.append(record_view)
+
+    return records
+
+
+def _select_vlm_record_for_step(vlm_records: list[dict], episode_idx: int, local_step: int):
+    if not vlm_records:
+        return None
+
+    episode_candidates = {episode_idx, episode_idx + 1}
+
+    exact = [r for r in vlm_records if r.get("episode") in episode_candidates and r.get("step") == local_step]
+    if exact:
+        return exact[-1]
+
+    candidates = []
+    for r in vlm_records:
+        if r.get("episode") not in episode_candidates:
+            continue
+        step_value = r.get("step")
+        if not isinstance(step_value, int):
+            continue
+        if step_value <= local_step:
+            candidates.append(r)
+    if candidates:
+        return sorted(candidates, key=lambda x: (x.get("step"), x.get("record_index", -1)))[-1]
+
+    return None
+
+
+def _log_vlm_record_windows(record: dict | None):
+    if record is None:
+        rr.log("vlm_message/metadata", rr.TextDocument("<No VLM record matched current step>"))
+        for idx in range(MAX_VLM_PAIR_SLOTS):
+            rr.log(f"vlm_message/pairs/{idx}/text", rr.TextDocument("<No paired text>"))
+            rr.log(f"vlm_message/pairs/{idx}/image", rr.Image(_VLM_EMPTY_IMAGE))
+        rr.log("vlm_message/response", rr.TextDocument("<No response>"))
+        return
+
+    rr.log(
+        "vlm_message/metadata",
+        rr.TextDocument(f"{record['header']}\n\n{record['sequence_text']}"),
+    )
+    for idx in range(MAX_VLM_PAIR_SLOTS):
+        if idx < len(record["pair_rows"]):
+            row = record["pair_rows"][idx]
+            rr.log(f"vlm_message/pairs/{idx}/text", rr.TextDocument(row["text"]))
+            rr.log(f"vlm_message/pairs/{idx}/image", rr.Image(row["image"]))
+        else:
+            rr.log(f"vlm_message/pairs/{idx}/text", rr.TextDocument("<No paired text>"))
+            rr.log(f"vlm_message/pairs/{idx}/image", rr.Image(_VLM_EMPTY_IMAGE))
+    rr.log("vlm_message/response", rr.TextDocument(record["response_text"]))
+
+
+def _log_checkpoint_windows(dataset, recent_checkpoints_by_step: dict, step: int):
+    cps = recent_checkpoints_by_step.get(step, [])
+    cps = cps[-5:]
+    padded_cps = [None] * (5 - len(cps)) + cps
+    for cp_idx, cp_step in enumerate(padded_cps):
+        if cp_step is not None:
+            try:
+                cp_item = dataset[cp_step]
+                top_key = next((k for k in cp_item if "image" in k and "middle" in k.lower()), None)
+                if not top_key:
+                    top_key = next((k for k in cp_item if "image" in k), None)
+
+                if top_key:
+                    img_data = cp_item[top_key]
+                    if isinstance(img_data, dict) and "bytes" in img_data:
+                        import io
+
+                        cp_img = Image.open(io.BytesIO(img_data["bytes"]))
+                    else:
+                        cp_img = img_data.numpy() if hasattr(img_data, "numpy") else img_data
+                        if cp_img.ndim == 3 and cp_img.shape[0] <= 4:
+                            cp_img = np.transpose(cp_img, (1, 2, 0))
+                    rr.log(f"checkpoints/cp_{cp_idx}", rr.Image(cp_img))
+                else:
+                    rr.log(f"checkpoints/cp_{cp_idx}", rr.Image(np.zeros((10, 10, 3), dtype=np.uint8)))
+            except Exception:
+                rr.log(f"checkpoints/cp_{cp_idx}", rr.Image(np.zeros((10, 10, 3), dtype=np.uint8)))
+        else:
+            rr.log(f"checkpoints/cp_{cp_idx}", rr.Image(np.zeros((10, 10, 3), dtype=np.uint8)))
 
 
 def _load_timing_series_from_npz(npz_path: Path):
@@ -230,6 +427,17 @@ def visualize_dataset(
         dataset.meta.episodes = load_episodes(dataset.root)
 
     total_episodes = len(dataset.meta.episodes)
+    dataset_root = Path(dataset.root)
+    use_vlm_panels = (dataset_root / "vlm").exists()
+    if use_vlm_panels:
+        vlm_records = _load_vlm_message_records(dataset_root)
+        if vlm_records:
+            print(f"[INFO] Loaded {len(vlm_records)} VLM debug record(s) from dataset directory.")
+        else:
+            print("[WARN] No VLM debug records found under <dataset_root>/vlm/debug_records.")
+    else:
+        vlm_records = []
+        print("[INFO] No <dataset_root>/vlm folder found. Falling back to checkpoint image windows.")
 
     failure_metrics = load_failure_metrics_jsonl(dataset.root)
 
@@ -330,6 +538,35 @@ def visualize_dataset(
             origin="overlay/episode_id",
         )
 
+        if use_vlm_panels:
+            pair_views = [
+                rrb.Horizontal(
+                    rrb.TextDocumentView(
+                        name=f"Window 3.{idx} - Request Pair Text",
+                        origin=f"vlm_message/pairs/{idx}/text",
+                    ),
+                    rrb.Spatial2DView(
+                        name=f"Window 3.{idx} - Request Pair Image",
+                        origin=f"vlm_message/pairs/{idx}/image",
+                    ),
+                    column_shares=[1, 1],
+                )
+                for idx in range(MAX_VLM_PAIR_SLOTS)
+            ]
+            middle_right_panel = rrb.Vertical(
+                rrb.TextDocumentView(name="Window 1 - Message Metadata", origin="vlm_message/metadata"),
+                *pair_views,
+                rrb.TextDocumentView(name="Window 4 - VLM Response", origin="vlm_message/response"),
+            )
+        else:
+            middle_right_panel = rrb.Vertical(
+                rrb.Spatial2DView(name="Checkpoint -5", origin="checkpoints/cp_0"),
+                rrb.Spatial2DView(name="Checkpoint -4", origin="checkpoints/cp_1"),
+                rrb.Spatial2DView(name="Checkpoint -3", origin="checkpoints/cp_2"),
+                rrb.Spatial2DView(name="Checkpoint -2", origin="checkpoints/cp_3"),
+                rrb.Spatial2DView(name="Checkpoint -1", origin="checkpoints/cp_4"),
+            )
+
         blueprint = rrb.Blueprint(
             rrb.Horizontal(
                 rrb.Horizontal(
@@ -365,13 +602,7 @@ def visualize_dataset(
                         ),
                         rrb.TimeSeriesView(name="Checkpoint Flag", origin="metrics/checkpoint_flag"),
                     ),
-                    rrb.Vertical(
-                        rrb.Spatial2DView(name="Checkpoint -5", origin="checkpoints/cp_0"),
-                        rrb.Spatial2DView(name="Checkpoint -4", origin="checkpoints/cp_1"),
-                        rrb.Spatial2DView(name="Checkpoint -3", origin="checkpoints/cp_2"),
-                        rrb.Spatial2DView(name="Checkpoint -2", origin="checkpoints/cp_3"),
-                        rrb.Spatial2DView(name="Checkpoint -1", origin="checkpoints/cp_4"),
-                    ),
+                    middle_right_panel,
                 ),
                 rrb.Vertical(*camera_views, id_overlay_view, row_shares=[6] * len(camera_views) + [1]),
                 column_shares=[2, 1],
@@ -412,7 +643,6 @@ def visualize_dataset(
     global_step = 0
     prev_attention_entropy = None
     prev_attention_step = None
-    warned_insufficient_checkpoint_steps: set[int] = set()
 
     for episode_idx in range(total_episodes):
         print(f"Streaming Episode {episode_idx}/{total_episodes}...", end="\r")
@@ -510,54 +740,21 @@ def visualize_dataset(
                     )
 
                 is_failed = i in td_failed_step_set or i in mahal_failed_step_set
-                if is_failed:
-                    cps = recent_checkpoints_by_step.get(i, [])
-                    cps = cps[-5:]
-                    if len(cps) < 5 and i not in warned_insufficient_checkpoint_steps:
-                        print(
-                            f"[WARN] Step {i}: only {len(cps)} checkpoint(s) available (<5). "
-                            "Missing slots are rendered as black placeholders."
-                        )
-                        warned_insufficient_checkpoint_steps.add(i)
-                    padded_cps = [None] * (5 - len(cps)) + cps
-                    for cp_idx, cp_step in enumerate(padded_cps):
-                        if cp_step is not None:
-                            try:
-                                cp_item = dataset[cp_step]
-                                top_key = next(
-                                    (k for k in cp_item if "image" in k and "middle" in k.lower()), None
-                                )
-                                if not top_key:
-                                    top_key = next((k for k in cp_item if "image" in k), None)
-
-                                if top_key:
-                                    img_data = cp_item[top_key]
-                                    if isinstance(img_data, dict) and "bytes" in img_data:
-                                        import io
-
-                                        cp_img = Image.open(io.BytesIO(img_data["bytes"]))
-                                    else:
-                                        cp_img = img_data.numpy() if hasattr(img_data, "numpy") else img_data
-                                        if cp_img.ndim == 3 and cp_img.shape[0] <= 4:
-                                            cp_img = np.transpose(cp_img, (1, 2, 0))
-                                    rr.log(f"checkpoints/cp_{cp_idx}", rr.Image(cp_img))
-                                else:
-                                    rr.log(
-                                        f"checkpoints/cp_{cp_idx}",
-                                        rr.Image(np.zeros((10, 10, 3), dtype=np.uint8)),
-                                    )
-                            except Exception:
-                                rr.log(
-                                    f"checkpoints/cp_{cp_idx}",
-                                    rr.Image(np.zeros((10, 10, 3), dtype=np.uint8)),
-                                )
-                        else:
+                if use_vlm_panels:
+                    local_step = i - from_idx
+                    matched_record = _select_vlm_record_for_step(vlm_records, episode_idx, local_step)
+                    if is_failed:
+                        _log_vlm_record_windows(matched_record)
+                    else:
+                        _log_vlm_record_windows(None)
+                else:
+                    if is_failed:
+                        _log_checkpoint_windows(dataset, recent_checkpoints_by_step, i)
+                    else:
+                        for cp_idx in range(5):
                             rr.log(
                                 f"checkpoints/cp_{cp_idx}", rr.Image(np.zeros((10, 10, 3), dtype=np.uint8))
                             )
-                else:
-                    for cp_idx in range(5):
-                        rr.log(f"checkpoints/cp_{cp_idx}", rr.Image(np.zeros((10, 10, 3), dtype=np.uint8)))
 
     print("\nDone streaming to Rerun.")
 
