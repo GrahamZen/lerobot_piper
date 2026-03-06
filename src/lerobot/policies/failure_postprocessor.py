@@ -47,6 +47,7 @@ class FailurePostprocessor:
 
         self.vlm_service = VLMService(video_path=self.config.demo_video_path)
         self._hooks = []
+        self.recovery_pending_wait: bool = False
 
         if self.config.enable_logging:
             self._register_hooks()
@@ -119,11 +120,10 @@ class FailurePostprocessor:
         self.metrics.process_step += 1
         if self.metrics.detect_failure():
             log_say("Failure detected")
-            if self.metrics.checkpoint_action_queue:
+            if self.config.enable_failure_handling and self.metrics.checkpoint_action_queue:
                 recovery_action = self._get_recovery_action(batch, intended_action)
                 log_say("Attempting recovery")
-                if self.config.enable_failure_handling:
-                    return recovery_action
+                return recovery_action
 
         return intended_action
 
@@ -146,8 +146,22 @@ class FailurePostprocessor:
             selected_index = 0
 
         checkpoint_action = self.metrics.checkpoint_action_queue[selected_index][1]
+        self.recovery_pending_wait = True
         self.vlm_service.save_debug_history()
+        # Recovery jump invalidates online tracking accumulated after checkpoints.
+        self.metrics.clear_tracking_state(reset_process_step=True)
+        self._clear_policy_runtime_context()
         return checkpoint_action.to(intended_action.device)
+
+    def _clear_policy_runtime_context(self) -> None:
+        """Clear policy-side runtime caches invalidated by a recovery jump."""
+        temporal_ensembler = getattr(self.policy, "temporal_ensembler", None)
+        if temporal_ensembler is not None and hasattr(temporal_ensembler, "reset"):
+            temporal_ensembler.reset()
+
+        action_queue = getattr(self.policy, "_action_queue", None)
+        if action_queue is not None and hasattr(action_queue, "clear"):
+            action_queue.clear()
 
     # ------------------------------------------------------------------
     # Lifecycle

@@ -406,10 +406,13 @@ class FailureMetrics:
         self.flush_metrics()
         self.flush_features()
 
-    def reset(self):
-        self.finalize()
-        self.episode += 1
-        self.process_step = 0
+    def clear_tracking_state(self, *, reset_process_step: bool = True) -> None:
+        """
+        This is used after a recovery jump to avoid consuming stale statistics
+        collected after the selected checkpoint.
+        """
+        if reset_process_step:
+            self.process_step = 0
         self.cam_features_this_step.clear()
         self.last_attn_weights = None
         self.last_chunk_endpoint = None
@@ -421,3 +424,8 @@ class FailureMetrics:
         self.recent_views.clear()
         self.checkpoint_action_queue.clear()
         self.checkpoint_step_set.clear()
+
+    def reset(self):
+        self.finalize()
+        self.episode += 1
+        self.clear_tracking_state(reset_process_step=True)

@@ -630,6 +630,12 @@ def record_loop(
         # TODO(steven, pepijn, adil): we should use a pipeline step to clip the action, so the sent action is the action that we input to the robot.
         _sent_action = robot.send_action(robot_action_to_send)
 
+        if policy is not None:
+            failure_postprocessor = policy._failure_postprocessor
+            if failure_postprocessor.recovery_pending_wait:
+                time.sleep(3.0)
+                failure_postprocessor.recovery_pending_wait = False
+
         # Write to dataset
         if dataset is not None:
             action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)
