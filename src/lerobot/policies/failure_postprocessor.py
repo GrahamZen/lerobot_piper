@@ -45,7 +45,10 @@ class FailurePostprocessor:
         )
         self.metrics.bind_policy(self.policy)
 
-        self.vlm_service = VLMService(video_path=self.config.demo_video_path)
+        self.vlm_service = VLMService(
+            video_path=self.config.demo_video_path,
+            output_dir=self.output_dir,
+        )
         self._hooks = []
         self.recovery_pending_wait: bool = False
 

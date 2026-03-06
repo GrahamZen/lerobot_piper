@@ -4,6 +4,7 @@ import os
 import re
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -21,6 +22,7 @@ class VLMService:
         video_path: str,
         api_key: str = None,
         model_name: str = "gemini-2.5-pro",
+        output_dir: str | Path | None = None,
     ):
         """
         Initialize the VLM service, upload the demo video, and create a chat session with memory.
@@ -33,10 +35,12 @@ class VLMService:
         self.debug_history: list[dict[str, Any]] = []
         self.debug_session_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.debug_session_dirname = f"vlm_debug_{self.debug_session_timestamp}"
-        self.debug_save_dir = "logs"
+        root_dir = Path(output_dir) if output_dir is not None else Path("logs")
+        self.debug_save_dir = str(root_dir / "vlm")
+        self.debug_records_root = os.path.join(self.debug_save_dir, "debug_records")
         self.debug_session_path: str | None = None
         self.saved_record_count = 0
-        self.log_dir = os.path.join(self.debug_save_dir, "vlm_service", self.debug_session_dirname)
+        self.log_dir = os.path.join(self.debug_save_dir, "service", self.debug_session_dirname)
         self.log_file_path = os.path.join(self.log_dir, "vlm_service.log")
         self.logger = self._setup_logger(model_name=model_name, video_path=video_path, masked_key=masked_key)
         self.to_pil = ToPILImage()
@@ -298,7 +302,7 @@ class VLMService:
         self.debug_history.append(record)
         return record
 
-    def save_debug_history(self, output_dir: str | None = None) -> str:
+    def save_debug_history(self, output_dir: str | Path | None = None) -> str:
         """
         Persist VLM debug history to a session-stable folder.
 
@@ -312,7 +316,9 @@ class VLMService:
         - metadata json
         """
         if output_dir is None:
-            output_dir = self.debug_save_dir
+            output_dir = self.debug_records_root
+
+        output_dir = os.fspath(output_dir)
 
         if self.debug_session_path is None:
             os.makedirs(output_dir, exist_ok=True)
