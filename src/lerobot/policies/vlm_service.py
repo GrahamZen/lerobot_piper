@@ -23,6 +23,7 @@ class VLMService:
         api_key: str = None,
         model_name: str = "gemini-2.5-pro",
         output_dir: str | Path | None = None,
+        initial_prompt: str | None = None,
     ):
         """
         Initialize the VLM service, upload the demo video, and create a chat session with memory.
@@ -81,8 +82,9 @@ class VLMService:
         )
         self.logger.info("[VLMService.__init__] Chat session created.")
 
-        initial_prompt = """
-    This is a task demonstration video for a robot. Please carefully observe the standard workflow. Next, I will send you a stitched three-view image at a failure timestamp (from left to right: left arm view, top camera view, right arm view), plus several stitched three-view images corresponding to candidate rollback timestamps in chronological order.
+        if initial_prompt is None:
+            initial_prompt = """
+    This is a successful demonstration for a bimanual manipulation task completed by two robot arms with parallel grippers. Please carefully observe the standard workflow. Next, I will send you a stitched three-view image at a failure timestamp (from left to right: left arm view, top camera view, right arm view), plus several stitched three-view images corresponding to candidate rollback timestamps in chronological order.
 
     You need to choose a safe and reasonable rollback state and provide a detailed analysis.
 
