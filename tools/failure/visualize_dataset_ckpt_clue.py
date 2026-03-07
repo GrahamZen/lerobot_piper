@@ -583,21 +583,13 @@ def visualize_dataset(
     # Register static marker styles in Rerun for all metrics
     if failure_metrics:
         metric_names = [
-            "temporal_disagreement",
             "temporal_disagreement_smoothed",
             "previous_checkpoint_step",
-            "following_error",
-            "attention_entropy",
-            "attention_entropy_downward_slope",
-            "mahalanobis_distance",
-            "endpoint_shift",
-            "action_jerk",
-            "checkpoint_flag",
         ]
         for metric_name in metric_names:
             rr.log(
                 f"metrics/{metric_name}/failed_markers",
-                rr.SeriesPoints(colors=[255, 0, 0], markers="circle", marker_sizes=6.0),
+                rr.SeriesPoints(colors=[255, 0, 0], markers="diamond", marker_sizes=5.0),
                 static=True,
             )
 
@@ -683,29 +675,10 @@ def visualize_dataset(
                 # Log red failure markers only when TD failure is detected (smoothed_td > cp_threshold)
                 is_td_failed = i in td_failed_step_set
                 if is_td_failed:
-                    rr.log("metrics/temporal_disagreement/failed_markers", rr.Scalars(raw_td))
                     rr.log("metrics/temporal_disagreement_smoothed/failed_markers", rr.Scalars(smooth_td))
                     rr.log(
                         "metrics/previous_checkpoint_step/failed_markers",
                         rr.Scalars(previous_checkpoint_by_step.get(i, np.nan)),
-                    )
-                    rr.log(
-                        "metrics/following_error/failed_markers", rr.Scalars(m.get("following_error", 0.0))
-                    )
-                    rr.log("metrics/attention_entropy/failed_markers", rr.Scalars(attention_entropy))
-                    rr.log(
-                        "metrics/attention_entropy_downward_slope/failed_markers",
-                        rr.Scalars(attention_entropy_downward_slope),
-                    )
-                    rr.log(
-                        "metrics/mahalanobis_distance/failed_markers",
-                        rr.Scalars(m.get("mahalanobis_distance", 0.0)),
-                    )
-                    rr.log("metrics/endpoint_shift/failed_markers", rr.Scalars(m.get("endpoint_shift", 0.0)))
-                    rr.log("metrics/action_jerk/failed_markers", rr.Scalars(m.get("action_jerk", 0.0)))
-                    rr.log(
-                        "metrics/checkpoint_flag/failed_markers",
-                        rr.Scalars(checkpoint_flag_by_step.get(i, 0.0)),
                     )
 
                 if use_vlm_panels:
