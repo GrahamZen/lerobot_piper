@@ -98,6 +98,13 @@ class FailurePostprocessor:
         new_actions_chunk: torch.Tensor | None,
     ) -> torch.Tensor:
         """Route postprocessing after the policy has produced its intended action."""
+        # Register initial action as first safe checkpoint at episode start
+        if self.metrics.process_step == 0:
+            initial_action_clone = self.metrics._clone_tensor_for_checkpoint(intended_action)
+            self.metrics.checkpoint_action_queue.append((0, initial_action_clone, {}))
+            self.metrics.checkpoint_step_set.add(0)
+            logger.debug("Registered initial robot action as safe checkpoint at step 0")
+
         if new_actions_chunk is not None:
             actual_qpos = batch.get(OBS_STATE)
             target_qpos = new_actions_chunk[:, 0] if new_actions_chunk.dim() == 3 else new_actions_chunk
