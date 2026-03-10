@@ -14,6 +14,7 @@ Usage:
 """
 
 import argparse
+import io
 import json
 from pathlib import Path
 
@@ -22,6 +23,7 @@ import numpy as np
 import rerun as rr
 import rerun.blueprint as rrb
 from PIL import Image
+from torch.utils.data import DataLoader, Subset
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
@@ -175,8 +177,6 @@ def _select_vlm_record_for_step(vlm_records: list[dict], episode_idx: int, step:
     if exact:
         return exact[-1]
 
-    # In practice VLM record `step` can lag/lead failure trigger by 1-2 steps.
-    # Use nearest record within a small tolerance to keep panels aligned with failure events.
     nearby: list[dict] = []
     for r in records_in_episode:
         step_value = r.get("step")
@@ -239,35 +239,15 @@ def _log_vlm_record_windows(record: dict | None):
     rr.log("vlm_message/response", rr.TextDocument(record["response_text"]))
 
 
-def _log_checkpoint_windows(dataset, recent_checkpoints_by_step: dict, step: int):
+def _log_checkpoint_windows(image_cache: dict, recent_checkpoints_by_step: dict, step: int):
     cps = recent_checkpoints_by_step.get(step, [])
     cps = cps[-5:]
     padded_cps = [None] * (5 - len(cps)) + cps
     for cp_idx, cp_step in enumerate(padded_cps):
-        if cp_step is not None:
-            try:
-                cp_item = dataset[cp_step]
-                top_key = next((k for k in cp_item if "image" in k and "middle" in k.lower()), None)
-                if not top_key:
-                    top_key = next((k for k in cp_item if "image" in k), None)
-
-                if top_key:
-                    img_data = cp_item[top_key]
-                    if isinstance(img_data, dict) and "bytes" in img_data:
-                        import io
-
-                        cp_img = Image.open(io.BytesIO(img_data["bytes"]))
-                    else:
-                        cp_img = img_data.numpy() if hasattr(img_data, "numpy") else img_data
-                        if cp_img.ndim == 3 and cp_img.shape[0] <= 4:
-                            cp_img = np.transpose(cp_img, (1, 2, 0))
-                    rr.log(f"checkpoints/cp_{cp_idx}", rr.Image(cp_img))
-                else:
-                    rr.log(f"checkpoints/cp_{cp_idx}", rr.Image(np.zeros((10, 10, 3), dtype=np.uint8)))
-            except Exception:
-                rr.log(f"checkpoints/cp_{cp_idx}", rr.Image(np.zeros((10, 10, 3), dtype=np.uint8)))
+        if cp_step is not None and cp_step in image_cache:
+            rr.log(f"checkpoints/cp_{cp_idx}", image_cache[cp_step])
         else:
-            rr.log(f"checkpoints/cp_{cp_idx}", rr.Image(np.zeros((10, 10, 3), dtype=np.uint8)))
+            rr.log(f"checkpoints/cp_{cp_idx}", rr.Clear(recursive=False))
 
 
 def _load_timing_series_from_npz(npz_path: Path):
@@ -406,7 +386,6 @@ def visualize_dataset(
     td_failed_steps = []
     td_failed_step_set = set()
 
-    # Load required config from model's failure_handling.json (raises error if not found)
     failure_handling_cfg = load_failure_handling_json(dataset.root, required=True)
     failure_cfg = load_failure_config(dataset.root, required=True)
 
@@ -421,7 +400,6 @@ def visualize_dataset(
     metrics_cfg = failure_handling_cfg["metrics"]
     td_config = metrics_cfg["temporal_disagreement"]
 
-    # Extract required cp_threshold
     td_cp_threshold = td_config.get("cp_threshold")
     if td_cp_threshold is None:
         raise ValueError(
@@ -431,11 +409,8 @@ def visualize_dataset(
     td_cp_threshold = float(td_cp_threshold)
     print(f"Loaded cp_threshold from failure_handling.json: {td_cp_threshold:.6f}")
 
-    # safety_margin is optional (visualization-only parameter)
     safety_margin = td_config.get("safety_margin", DEFAULT_SAFETY_MARGIN)
 
-    # Ensure failure_cfg uses the correct values from JSON (not defaults)
-    # The FailureConfig object may use defaults due to schema validation issues
     td_cfg = failure_cfg.metrics.temporal_disagreement
     td_cfg.window_size = int(td_config.get("window_size", td_cfg.window_size))
     td_cfg.eval_delay = int(td_config.get("eval_delay", td_cfg.eval_delay))
@@ -458,7 +433,6 @@ def visualize_dataset(
     print(f"  valley_prominence: {td_cfg.valley_prominence}")
     print(f"  safety_margin: {safety_margin}")
 
-    # Allow command-line override of parameters
     if checkpoint_signal_config:
         print("Applying command-line overrides:")
         td_cfg.window_size = int(checkpoint_signal_config.get("window_size", td_cfg.window_size))
@@ -493,9 +467,7 @@ def visualize_dataset(
             dataset_episodes=dataset.meta.episodes,
         )
 
-        # Identify red markers based on FailureMetrics.detect_failure()
         for step in sorted(failure_metrics.keys()):
-            # TD decision must exactly follow FailureMetrics.detect_failure()
             if detect_failure_by_step.get(step, False):
                 td_failed_steps.append(step)
                 td_failed_step_set.add(step)
@@ -510,7 +482,6 @@ def visualize_dataset(
         )
 
         if use_vlm_panels:
-            # Create text views (left column)
             text_views = [
                 rrb.TextDocumentView(
                     name=f"Window 3.{idx} - Request Pair Text",
@@ -518,7 +489,6 @@ def visualize_dataset(
                 )
                 for idx in range(MAX_VLM_PAIR_SLOTS)
             ]
-            # Create image views (right column)
             image_views = [
                 rrb.Spatial2DView(
                     name=f"Window 3.{idx} - Request Pair Image",
@@ -562,15 +532,8 @@ def visualize_dataset(
                             name="Previous Checkpoint Step", origin="metrics/previous_checkpoint_step"
                         ),
                         rrb.TimeSeriesView(name="Attention Entropy", origin="metrics/attention_entropy"),
-                        # rrb.TimeSeriesView(
-                        #     name="Mahalanobis Distance", origin="metrics/mahalanobis_distance"
-                        # ),
                         rrb.TimeSeriesView(name="Endpoint Shift", origin="metrics/endpoint_shift"),
                         rrb.TimeSeriesView(name="Action Jerk", origin="metrics/action_jerk"),
-                        # rrb.TimeSeriesView(
-                        #     name="Attention Entropy Downward Slope",
-                        #     origin="metrics/attention_entropy_downward_slope",
-                        # ),
                         rrb.TimeSeriesView(name="Checkpoint Flag", origin="metrics/checkpoint_flag"),
                     ),
                     middle_right_panel,
@@ -588,7 +551,6 @@ def visualize_dataset(
     if blueprint:
         rr.send_blueprint(blueprint)
 
-    # Register static marker styles in Rerun for all metrics
     if failure_metrics:
         metric_names = [
             "temporal_disagreement_smoothed",
@@ -605,6 +567,9 @@ def visualize_dataset(
     prev_attention_entropy = None
     prev_attention_step = None
 
+    image_cache = {}
+    was_td_failed = False
+
     for episode_idx in range(total_episodes):
         print(f"Streaming Episode {episode_idx}/{total_episodes}...", end="\r")
         ep_meta = dataset.meta.episodes[episode_idx]
@@ -619,32 +584,61 @@ def visualize_dataset(
             else ep_meta["dataset_to_index"][0]
         )
 
-        for i in range(from_idx, to_idx, stride):
+        episode_indices = list(range(from_idx, to_idx, stride))
+
+        def _collate_fn(batch):
+            return batch[0]
+
+        loader = DataLoader(
+            Subset(dataset, episode_indices),
+            batch_size=1,
+            num_workers=4,
+            prefetch_factor=2,
+            collate_fn=_collate_fn,
+            shuffle=False,
+        )
+
+        for i, item in zip(episode_indices, loader, strict=True):
             rr.set_time_sequence("global_step", global_step)
             global_step += 1
             rr.log("overlay/episode_id", rr.TextDocument(f"{episode_idx}"), static=False)
 
-            item = None
-            try:
-                item = dataset[i]
-            except (IndexError, KeyError, RuntimeError, OSError) as exc:
-                print(f"Skipping step {i}: failed to load item ({exc})")
-
             if item is None:
                 continue
+
+            main_camera_rr_img = None
 
             for img_key in [k for k in item if "image" in k]:
                 img_data = item[img_key]
                 clean_key = img_key.replace("observation.images.", "")
-                if isinstance(img_data, dict) and "bytes" in img_data:
-                    import io
 
-                    rr.log(f"cameras/{clean_key}", rr.Image(Image.open(io.BytesIO(img_data["bytes"]))))
+                rr_img_obj = None
+
+                if isinstance(img_data, dict) and "bytes" in img_data:
+                    try:
+                        rr_img_obj = rr.ImageEncoded(contents=img_data["bytes"])
+                    except AttributeError:
+                        if hasattr(rr, "EncodedImage"):
+                            rr_img_obj = rr.EncodedImage(contents=img_data["bytes"])
+                        else:
+                            rr_img_obj = rr.Image(Image.open(io.BytesIO(img_data["bytes"])))
                 else:
                     arr = img_data.numpy() if hasattr(img_data, "numpy") else img_data
                     if arr.ndim == 3 and arr.shape[0] <= 4:
                         arr = np.transpose(arr, (1, 2, 0))
-                    rr.log(f"cameras/{clean_key}", rr.Image(arr))
+                    rr_img_obj = rr.Image(arr)
+
+                rr.log(f"cameras/{clean_key}", rr_img_obj)
+
+                if "middle" in clean_key.lower() or main_camera_rr_img is None:
+                    main_camera_rr_img = rr_img_obj
+
+            if main_camera_rr_img is not None:
+                image_cache[i] = main_camera_rr_img
+
+            old_keys = [k for k in list(image_cache.keys()) if k < i - 150]
+            for k in old_keys:
+                del image_cache[k]
 
             if failure_metrics:
                 m = failure_metrics.get(i, {})
@@ -680,7 +674,6 @@ def visualize_dataset(
                 )
                 rr.log("metrics/checkpoint_flag", rr.Scalars(checkpoint_flag_by_step.get(i, 0.0)))
 
-                # Log red failure markers only when TD failure is detected (smoothed_td > cp_threshold)
                 is_td_failed = i in td_failed_step_set
                 if is_td_failed:
                     rr.log("metrics/temporal_disagreement_smoothed/failed_markers", rr.Scalars(smooth_td))
@@ -697,12 +690,13 @@ def visualize_dataset(
                         _log_vlm_record_windows(None)
                 else:
                     if is_td_failed:
-                        _log_checkpoint_windows(dataset, recent_checkpoints_by_step, i)
+                        _log_checkpoint_windows(image_cache, recent_checkpoints_by_step, i)
+                        was_td_failed = True
                     else:
-                        for cp_idx in range(5):
-                            rr.log(
-                                f"checkpoints/cp_{cp_idx}", rr.Image(np.zeros((10, 10, 3), dtype=np.uint8))
-                            )
+                        if was_td_failed:
+                            for cp_idx in range(5):
+                                rr.log(f"checkpoints/cp_{cp_idx}", rr.Clear(recursive=False))
+                            was_td_failed = False
 
     print("\nDone streaming to Rerun.")
 
