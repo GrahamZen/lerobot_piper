@@ -49,6 +49,7 @@ class EpisodeFailureExtractor:
             self.previous_checkpoint_by_step,
             self.checkpoint_flag_by_step,
             self.recent_checkpoints_by_step,
+            self.detect_failure_by_step,
         ) = replay_checkpoint_series(
             self.failure_metrics,
             self.failure_config,
@@ -65,11 +66,11 @@ class EpisodeFailureExtractor:
         failed_td = None
 
         for step_idx in range(from_idx, to_idx):
-            if step_idx in self.failure_metrics:
-                raw_td = float(self.failure_metrics[step_idx].get("temporal_disagreement", 0.0))
-                if raw_td > self.td_cp_threshold:
+            if step_idx in self.smoothed_td_by_step:
+                smoothed_td = float(self.smoothed_td_by_step[step_idx])
+                if self.detect_failure_by_step.get(step_idx, False):
                     failed_step = step_idx
-                    failed_td = raw_td
+                    failed_td = smoothed_td
                     break
 
         result: dict[str, Any] = {

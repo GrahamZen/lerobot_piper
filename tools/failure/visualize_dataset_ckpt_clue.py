@@ -377,16 +377,24 @@ def visualize_dataset(
 
     total_episodes = len(dataset.meta.episodes)
     dataset_root = Path(dataset.root)
-    use_vlm_panels = (dataset_root / "vlm").exists()
-    if use_vlm_panels:
+    has_vlm_dir = (dataset_root / "vlm").exists()
+    use_vlm_panels = False
+    if has_vlm_dir:
         vlm_records = _load_vlm_message_records(dataset_root)
         if vlm_records:
+            use_vlm_panels = True
             print(f"[INFO] Loaded {len(vlm_records)} VLM debug record(s) from dataset directory.")
         else:
-            print("[WARN] No VLM debug records found under <dataset_root>/vlm/debug_records.")
+            print(
+                "[WARN] No usable VLM debug records found under <dataset_root>/vlm/debug_records. "
+                "Falling back to checkpoint image windows computed from failure_metrics.jsonl."
+            )
     else:
         vlm_records = []
-        print("[INFO] No <dataset_root>/vlm folder found. Falling back to checkpoint image windows.")
+        print(
+            "[INFO] No <dataset_root>/vlm folder found. "
+            "Falling back to checkpoint image windows computed from failure_metrics.jsonl."
+        )
 
     failure_metrics = load_failure_metrics_jsonl(dataset.root)
 
