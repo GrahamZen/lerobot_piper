@@ -140,6 +140,7 @@ def load_or_create_failure_handling_config(failure_handling_path: Path) -> dict:
                 "valley_lookback": 8,
                 "valley_lookahead": 8,
                 "valley_prominence": 0.0,
+                "rho": 1.0,
             },
             "following_error": {
                 "enabled": True,

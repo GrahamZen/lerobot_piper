@@ -78,7 +78,9 @@ class FailureMetrics:
     # Metric computation
     # ------------------------------------------------------------------
 
-    def get_temporal_disagreement(self, new_actions_chunk: torch.Tensor) -> float | torch.Tensor:
+    def get_temporal_disagreement(
+        self, new_actions_chunk: torch.Tensor, rho: float | None = None
+    ) -> float | torch.Tensor:
         if self.process_step == 0 or self._policy is None:
             return 0.0
 
@@ -95,8 +97,23 @@ class FailureMetrics:
         if overlap_len == 0 or new_actions_chunk.shape[1] < overlap_len:
             return 0.0
 
+        if rho is None:
+            rho = self.config.metrics.temporal_disagreement.rho
+
         new_plan = new_actions_chunk[:, :overlap_len]
-        return F.mse_loss(old_plan, new_plan)
+        diff_sq = (old_plan - new_plan) ** 2  # (batch, T, action_dim)
+
+        if rho == 1.0:
+            return diff_sq.mean()
+
+        # weights: [1, rho, rho^2, ..., rho^(T-1)], shape (T,)
+        t = diff_sq.shape[1]
+        exponents = torch.arange(t, dtype=diff_sq.dtype, device=diff_sq.device)
+        weights = rho**exponents  # (T,)
+        weights = weights / weights.sum()
+        # broadcast over (batch, T, action_dim)
+        weighted = diff_sq * weights.unsqueeze(0).unsqueeze(-1)
+        return weighted.sum(dim=1).mean()
 
     def get_following_error(
         self, target_qpos: torch.Tensor, actual_qpos: torch.Tensor
@@ -313,6 +330,10 @@ class FailureMetrics:
                 if temporal_disagreement is None
                 else temporal_disagreement
             )
+            for _rho in (0, 0.1, 0.5, 0.7, 0.8, 0.9, 0.95):
+                metrics[f"temporal_disagreement_rho{_rho}"] = self.get_temporal_disagreement(
+                    actions_chunk, rho=_rho
+                )
 
         if self.config.metrics.following_error.enabled:
             metrics["following_error"] = self.get_following_error(target_qpos, actual_qpos)

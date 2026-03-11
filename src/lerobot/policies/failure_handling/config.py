@@ -18,6 +18,7 @@ class TemporalDisagreementConfig:
     valley_lookback: int = 8
     valley_lookahead: int = 8
     valley_prominence: float = 0.0
+    rho: float = 1.0  # Geometric decay factor for weighted temporal disagreement
 
     def __post_init__(self):
         if self.cp_threshold < 0:
