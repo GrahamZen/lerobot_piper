@@ -158,6 +158,11 @@ def load_or_create_failure_handling_config(failure_handling_path: Path) -> dict:
             "action_jerk": {
                 "enabled": True,
             },
+            "action_entropy": {
+                "enabled": True,
+                "min_bandwidth": 1e-5,
+                "min_density": 1e-35,
+            },
         },
     }
 

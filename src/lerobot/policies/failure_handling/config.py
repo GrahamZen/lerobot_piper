@@ -45,6 +45,22 @@ class MahalanobisConfig(BaseMetricConfig):
 
 
 @dataclass
+class ActionEntropyConfig(BaseMetricConfig):
+    """Config for KDE-based action entropy computed from overlapping chunk predictions.
+
+    Attributes:
+        enabled: Whether to compute and log action entropy each step.
+        min_bandwidth: Lower bound for Silverman's rule bandwidth, prevents
+            degenerate kernels when consecutive predictions are nearly identical.
+        min_density: Lower bound for KDE density before taking log, avoids -inf.
+    """
+
+    enabled: bool = False
+    min_bandwidth: float = 1e-5
+    min_density: float = 1e-35
+
+
+@dataclass
 class MetricsConfig:
     temporal_disagreement: TemporalDisagreementConfig = field(default_factory=TemporalDisagreementConfig)
     following_error: BaseMetricConfig = field(
@@ -54,6 +70,7 @@ class MetricsConfig:
     mahalanobis_distance: MahalanobisConfig = field(default_factory=MahalanobisConfig)
     endpoint_shift: BaseMetricConfig = field(default_factory=BaseMetricConfig)
     action_jerk: BaseMetricConfig = field(default_factory=BaseMetricConfig)
+    action_entropy: ActionEntropyConfig = field(default_factory=ActionEntropyConfig)
 
 
 @dataclass

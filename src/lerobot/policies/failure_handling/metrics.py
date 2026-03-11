@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import time
 from collections import deque
 from pathlib import Path
@@ -12,6 +13,49 @@ import torch.nn.functional as F  # noqa: N812
 from lerobot.policies.failure_handling.config import FailureConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _compute_action_entropy(
+    action_samples: torch.Tensor,
+    min_bandwidth: float = 1e-5,
+    min_density: float = 1e-35,
+) -> torch.Tensor:
+    """KDE-based action entropy from overlapping chunk predictions.
+
+    Mirrors the paper-style procedure in tools/failure/action_entropy_memory.py
+    but operates on (M, D) tensors already assembled by the caller.
+
+    Args:
+        action_samples: Shape (M, D) — M overlapping predictions for the same
+            target timestep, each of dimension D (action_dim).
+        min_bandwidth: Lower-bound for Silverman bandwidth to prevent degenerate kernels.
+        min_density: Lower-bound for KDE density before log to avoid -inf.
+
+    Returns:
+        Scalar entropy estimate (torch.Tensor, 0-d).
+    """
+    sample_count, action_dim = action_samples.shape
+    dtype = action_samples.dtype
+    device = action_samples.device
+
+    min_bw_t = torch.tensor(min_bandwidth, dtype=dtype, device=device)
+    min_density_t = torch.tensor(min_density, dtype=dtype, device=device)
+    gaussian_norm_t = torch.tensor(math.sqrt(2.0 * math.pi), dtype=dtype, device=device)
+
+    sigma = torch.std(action_samples, dim=0, unbiased=sample_count > 1)
+    sigma = torch.clamp(sigma, min=min_bw_t)
+    bandwidth = torch.clamp(1.06 * sigma * (sample_count ** (-0.2)), min=min_bw_t)
+
+    squared_mahalanobis = torch.zeros((sample_count, sample_count), dtype=dtype, device=device)
+    for dim_idx in range(action_dim):
+        vals = action_samples[:, dim_idx]
+        diffs = vals.unsqueeze(1) - vals.unsqueeze(0)
+        squared_mahalanobis = squared_mahalanobis + (diffs / bandwidth[dim_idx]) ** 2
+
+    log_kernel_norm = torch.log(bandwidth * gaussian_norm_t).sum()
+    kernel_vals = torch.exp(-0.5 * squared_mahalanobis - log_kernel_norm)
+    densities = torch.clamp(kernel_vals.mean(dim=1), min=min_density_t)
+    return -torch.log(densities).mean()
 
 
 class FailureMetrics:
@@ -70,6 +114,10 @@ class FailureMetrics:
             maxlen=self.config.checkpoint_queue_size
         )
         self.checkpoint_step_set: set[int] = set()
+
+        # Rolling buffer for action-entropy: stores (log_step, chunk_tensor) pairs
+        # where chunk_tensor has shape (1, chunk_size, action_dim).
+        self.recent_action_chunks: list[tuple[int, torch.Tensor]] = []
 
     def bind_policy(self, policy):
         """Used to fetch the temporal_ensembler internally."""
@@ -182,6 +230,48 @@ class FailureMetrics:
         acceleration = torch.diff(velocity, dim=1)
         jerk = torch.diff(acceleration, dim=1)
         return torch.norm(jerk, dim=-1).mean()
+
+    def get_action_chunk_entropy(self, actions_chunk: torch.Tensor) -> float | torch.Tensor:
+        """Estimate action entropy from overlapping chunk predictions at the current log-step.
+
+        Maintains a rolling buffer (``recent_action_chunks``) of past action chunks.
+        For the current log-step ``s``, every chunk stored at source step ``t`` provides
+        a prediction at horizon ``s - t``.  All such overlapping single-step predictions
+        are collected and passed to the KDE-based entropy estimator.
+
+        Returns 0.0 when fewer than two overlapping predictions are available.
+        """
+        if actions_chunk.dim() < 3:
+            return 0.0
+
+        ae_cfg = self.config.metrics.action_entropy
+        chunk_size = actions_chunk.shape[1]
+        current_step = self.step
+
+        # Register the current chunk
+        self.recent_action_chunks.append((current_step, actions_chunk.detach()))
+
+        # Discard entries that no longer overlap with the current step
+        self.recent_action_chunks = [
+            (s, c) for s, c in self.recent_action_chunks if current_step - s < chunk_size
+        ]
+
+        # Collect one prediction per overlapping source chunk
+        overlapping: list[torch.Tensor] = []
+        for source_step, source_chunk in self.recent_action_chunks:
+            horizon = current_step - source_step
+            if 0 <= horizon < source_chunk.shape[1]:
+                overlapping.append(source_chunk[:, horizon, :])  # (1, action_dim)
+
+        if len(overlapping) < 2:
+            return 0.0
+
+        action_samples = torch.cat(overlapping, dim=0)  # (M, action_dim)
+        return _compute_action_entropy(
+            action_samples,
+            min_bandwidth=ae_cfg.min_bandwidth,
+            min_density=ae_cfg.min_density,
+        )
 
     # ------------------------------------------------------------------
     # State tracking and checkpoints
@@ -353,6 +443,9 @@ class FailureMetrics:
         if self.config.metrics.action_jerk.enabled:
             metrics["action_jerk"] = self.get_action_jerk(actions_chunk)
 
+        if self.config.metrics.action_entropy.enabled:
+            metrics["action_entropy"] = self.get_action_chunk_entropy(actions_chunk)
+
         if (
             self.cam_features_this_step
             and self.output_dir is not None
@@ -485,6 +578,7 @@ class FailureMetrics:
         self.recent_actions.clear()
         self.recent_steps.clear()
         self.recent_views.clear()
+        self.recent_action_chunks.clear()
         self.checkpoint_action_queue.clear()
         self.checkpoint_step_set.clear()
 
