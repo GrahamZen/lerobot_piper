@@ -385,6 +385,7 @@ def visualize_dataset(
 
     td_failed_steps = []
     td_failed_step_set = set()
+    vlm_trigger_step_set = set()
 
     failure_handling_cfg = load_failure_handling_json(dataset.root, required=True)
     failure_cfg = load_failure_config(dataset.root, required=True)
@@ -471,6 +472,8 @@ def visualize_dataset(
             if detect_failure_by_step.get(step, False):
                 td_failed_steps.append(step)
                 td_failed_step_set.add(step)
+            if bool(failure_metrics[step].get("vlm_request", False)):
+                vlm_trigger_step_set.add(step)
 
     camera_names = [key.replace("observation.images.", "") for key in dataset.meta.camera_keys]
 
@@ -683,8 +686,14 @@ def visualize_dataset(
                     )
 
                 if use_vlm_panels:
-                    matched_record = _select_vlm_record_for_step(vlm_records, episode_idx, i)
-                    if is_td_failed:
+                    matched_record = _select_vlm_record_for_step(
+                        vlm_records,
+                        episode_idx,
+                        i,
+                        max_step_gap=0 if vlm_trigger_step_set else 3,
+                    )
+                    should_show_vlm = (i in vlm_trigger_step_set) if vlm_trigger_step_set else is_td_failed
+                    if should_show_vlm:
                         _log_vlm_record_windows(matched_record)
                     else:
                         _log_vlm_record_windows(None)

@@ -145,11 +145,14 @@ class FailurePostprocessor:
         if not self.metrics.checkpoint_action_queue:
             return intended_action
 
+        current_metrics_step = max(0, self.metrics.step - 1)
+        self.metrics.mark_last_logged_vlm_request()
+
         selected_index = self.vlm_service.select_checkpoint_index(
             batch=batch,
             checkpoint_queue=list(self.metrics.checkpoint_action_queue),
             episode=self.metrics.episode,
-            step=max(0, self.metrics.process_step - 1),
+            step=current_metrics_step,
         )
 
         if selected_index is None or not (0 <= selected_index < len(self.metrics.checkpoint_action_queue)):

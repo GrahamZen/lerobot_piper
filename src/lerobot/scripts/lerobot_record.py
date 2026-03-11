@@ -592,6 +592,12 @@ def record_loop(
         if is_recovering:
             # Keep writing frames during recovery while skipping inference and send_action.
             action_values = last_action_values
+            if policy is not None and getattr(policy, "_failure_postprocessor", None) is not None:
+                failure_postprocessor = policy._failure_postprocessor
+                if failure_postprocessor.config.enable_logging:
+                    failure_postprocessor.metrics.log_recovery_wait_step()
+                    if failure_postprocessor.config.flush_metrics_every_step:
+                        failure_postprocessor.metrics.flush_metrics()
         else:
             act_processed_policy = None
 

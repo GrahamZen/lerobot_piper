@@ -57,6 +57,7 @@ class FailureMetrics:
         # Buffers for JSONL logs and mahalanobis feature dumps
         self.metrics_buffer: list[dict[str, Any]] = []
         self.feature_buffer: list[dict[str, Any]] = []
+        self.last_logged_metrics: dict[str, Any] | None = None
 
         # Online checkpoint state
         td_cfg = self.config.metrics.temporal_disagreement
@@ -322,6 +323,8 @@ class FailureMetrics:
             "episode": self.episode,
             "step": self.step,
             "timestamp": time.time(),
+            "is_recovery_wait": False,
+            "vlm_request": False,
         }
 
         if self.config.metrics.temporal_disagreement.enabled:
@@ -372,12 +375,51 @@ class FailureMetrics:
         if self.output_dir is not None:
             self.metrics_buffer.append(metrics)
 
+        self.last_logged_metrics = metrics.copy()
+
         # Clear per-step caches
         self.cam_features_this_step.clear()
         self.last_attn_weights = None
         self.step += 1
 
         return metrics
+
+    def mark_last_logged_vlm_request(self) -> bool:
+        if self.last_logged_metrics is None:
+            return False
+
+        self.last_logged_metrics["vlm_request"] = True
+        if self.metrics_buffer:
+            self.metrics_buffer[-1]["vlm_request"] = True
+        return True
+
+    def log_recovery_wait_step(self) -> bool:
+        """
+        During recovery wait (no new inference), duplicate the previous metrics row
+        and only refresh step/timestamp so metrics stay aligned with dataset frames.
+        """
+        source = None
+        if self.metrics_buffer:
+            source = self.metrics_buffer[-1]
+        elif self.last_logged_metrics is not None:
+            source = self.last_logged_metrics
+
+        if source is None:
+            return False
+
+        metrics = source.copy()
+        metrics["episode"] = self.episode
+        metrics["step"] = self.step
+        metrics["timestamp"] = time.time()
+        metrics["is_recovery_wait"] = True
+        metrics["vlm_request"] = False
+
+        if self.output_dir is not None:
+            self.metrics_buffer.append(metrics)
+
+        self.last_logged_metrics = metrics.copy()
+        self.step += 1
+        return True
 
     def flush_metrics(self):
         if not self.metrics_buffer or self.output_dir is None:
