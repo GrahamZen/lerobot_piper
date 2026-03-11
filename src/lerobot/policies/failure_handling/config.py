@@ -53,11 +53,14 @@ class ActionEntropyConfig(BaseMetricConfig):
         min_bandwidth: Lower bound for Silverman's rule bandwidth, prevents
             degenerate kernels when consecutive predictions are nearly identical.
         min_density: Lower bound for KDE density before taking log, avoids -inf.
+        min_overlap_samples: Minimum number of overlapping action predictions
+            required before computing entropy/max-diff.
     """
 
     enabled: bool = False
     min_bandwidth: float = 1e-5
     min_density: float = 1e-35
+    min_overlap_samples: int = 3
 
 
 @dataclass

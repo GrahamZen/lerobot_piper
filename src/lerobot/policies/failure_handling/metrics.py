@@ -231,22 +231,35 @@ class FailureMetrics:
         jerk = torch.diff(acceleration, dim=1)
         return torch.norm(jerk, dim=-1).mean()
 
-    def get_action_chunk_entropy(self, actions_chunk: torch.Tensor) -> float | torch.Tensor:
-        """Estimate action entropy from overlapping chunk predictions at the current log-step.
+    def get_action_chunk_entropy(
+        self, actions_chunk: torch.Tensor
+    ) -> tuple[float | torch.Tensor, float | torch.Tensor]:
+        """Estimate action entropy and max sample diff from overlapping chunk predictions.
 
         Maintains a rolling buffer (``recent_action_chunks``) of past action chunks.
         For the current log-step ``s``, every chunk stored at source step ``t`` provides
         a prediction at horizon ``s - t``.  All such overlapping single-step predictions
         are collected and passed to the KDE-based entropy estimator.
 
-        Returns 0.0 when fewer than two overlapping predictions are available.
+        Returns:
+            (entropy, max_diff): Both are 0.0 when the overlap count is below
+                config.metrics.action_entropy.min_overlap_samples.
         """
         if actions_chunk.dim() < 3:
-            return 0.0
+            return 0.0, 0.0
 
         ae_cfg = self.config.metrics.action_entropy
         chunk_size = actions_chunk.shape[1]
         current_step = self.step
+
+        # Episode start should always reset the overlap buffer even if global step is continuous.
+        if self.process_step == 0:
+            self.recent_action_chunks.clear()
+
+        # Inference/logging can have discontinuities (episode boundary, recovery wait,
+        # dropped frames). Reset overlap buffer so stale chunks do not create fake spikes.
+        if self.recent_action_chunks and current_step != self.recent_action_chunks[-1][0] + 1:
+            self.recent_action_chunks.clear()
 
         # Register the current chunk
         self.recent_action_chunks.append((current_step, actions_chunk.detach()))
@@ -263,15 +276,18 @@ class FailureMetrics:
             if 0 <= horizon < source_chunk.shape[1]:
                 overlapping.append(source_chunk[:, horizon, :])  # (1, action_dim)
 
-        if len(overlapping) < 2:
-            return 0.0
+        min_overlap = max(2, int(ae_cfg.min_overlap_samples))
+        if len(overlapping) < min_overlap:
+            return 0.0, 0.0
 
         action_samples = torch.cat(overlapping, dim=0)  # (M, action_dim)
-        return _compute_action_entropy(
+        entropy = _compute_action_entropy(
             action_samples,
             min_bandwidth=ae_cfg.min_bandwidth,
             min_density=ae_cfg.min_density,
         )
+        max_diff = torch.abs(action_samples - action_samples[0:1]).max()
+        return entropy, max_diff
 
     # ------------------------------------------------------------------
     # State tracking and checkpoints
@@ -444,7 +460,9 @@ class FailureMetrics:
             metrics["action_jerk"] = self.get_action_jerk(actions_chunk)
 
         if self.config.metrics.action_entropy.enabled:
-            metrics["action_entropy"] = self.get_action_chunk_entropy(actions_chunk)
+            _ae, _ae_max_diff = self.get_action_chunk_entropy(actions_chunk)
+            metrics["action_entropy"] = _ae
+            metrics["action_entropy_max_diff"] = _ae_max_diff
 
         if (
             self.cam_features_this_step

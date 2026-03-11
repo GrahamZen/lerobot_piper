@@ -118,11 +118,6 @@ def resolve_pretrained_path(record_config: dict) -> Path:
 
 
 def load_or_create_failure_handling_config(failure_handling_path: Path) -> dict:
-    if failure_handling_path.exists():
-        with failure_handling_path.open("r", encoding="utf-8") as file:
-            return json.load(file)
-
-    # Default configuration
     return {
         "demo_video_path": "demo.mp4",
         "enable_logging": True,
@@ -162,6 +157,7 @@ def load_or_create_failure_handling_config(failure_handling_path: Path) -> dict:
                 "enabled": True,
                 "min_bandwidth": 1e-5,
                 "min_density": 1e-35,
+                "min_overlap_samples": 3,
             },
         },
     }
