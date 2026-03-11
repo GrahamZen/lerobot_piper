@@ -146,24 +146,33 @@ class FailurePostprocessor:
             return intended_action
 
         current_metrics_step = max(0, self.metrics.step - 1)
-        self.metrics.mark_last_logged_vlm_request()
 
-        selected_index = self.vlm_service.select_checkpoint_index(
-            batch=batch,
-            checkpoint_queue=list(self.metrics.checkpoint_action_queue),
-            episode=self.metrics.episode,
-            step=current_metrics_step,
-        )
-
-        if selected_index is None or not (0 <= selected_index < len(self.metrics.checkpoint_action_queue)):
+        if len(self.metrics.checkpoint_action_queue) == 1:
             selected_index = 0
+            logger.debug("Single checkpoint in queue, skipping VLM service")
+        else:
+            self.metrics.mark_last_logged_vlm_request()
+            selected_index = self.vlm_service.select_checkpoint_index(
+                batch=batch,
+                checkpoint_queue=list(self.metrics.checkpoint_action_queue),
+                episode=self.metrics.episode,
+                step=current_metrics_step,
+            )
+            if selected_index is None or not (
+                0 <= selected_index < len(self.metrics.checkpoint_action_queue)
+            ):
+                selected_index = 0
 
-        checkpoint_action = self.metrics.checkpoint_action_queue[selected_index][1]
+        selected_checkpoint = self.metrics.checkpoint_action_queue[selected_index]
+        checkpoint_step, checkpoint_action, checkpoint_obs = selected_checkpoint
         self.recovery_pending_wait = True
         self.vlm_service.save_debug_history()
         # Recovery jump invalidates online tracking accumulated after checkpoints.
         self.metrics.clear_tracking_state(reset_process_step=True)
         self._clear_policy_runtime_context()
+        self.metrics.checkpoint_action_queue.append((checkpoint_step, checkpoint_action, checkpoint_obs))
+        self.metrics.checkpoint_step_set.add(checkpoint_step)
+        logger.debug("Restored checkpoint at step %d back into queue after recovery", checkpoint_step)
         return checkpoint_action.to(intended_action.device)
 
     def _clear_policy_runtime_context(self) -> None:
