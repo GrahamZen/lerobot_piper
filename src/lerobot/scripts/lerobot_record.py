@@ -877,6 +877,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     log_say("Re-record episode", cfg.play_sounds)
                     events["rerecord_episode"] = False
                     events["exit_early"] = False
+                    if policy is not None and getattr(policy, "_failure_postprocessor", None) is not None:
+                        policy._failure_postprocessor.metrics.discard_current_episode_buffered_logs()
                     dataset.clear_episode_buffer()
                     continue
 

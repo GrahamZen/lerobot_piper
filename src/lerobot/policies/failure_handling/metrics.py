@@ -616,6 +616,39 @@ class FailureMetrics:
         self.step += 1
         return True
 
+    def discard_current_episode_buffered_logs(self) -> tuple[int, int]:
+        """Drop in-memory logs/features belonging to the current episode.
+
+        Used when `lerobot-record` re-records the current episode and clears
+        the dataset episode buffer. This keeps metric logs consistent with the
+        retained dataset content as long as rows are still buffered in memory.
+        """
+        dropped_metrics = 0
+        dropped_features = 0
+
+        if self.metrics_buffer:
+            before = len(self.metrics_buffer)
+            self.metrics_buffer = [m for m in self.metrics_buffer if m.get("episode") != self.episode]
+            dropped_metrics = before - len(self.metrics_buffer)
+
+        if self.feature_buffer:
+            before = len(self.feature_buffer)
+            self.feature_buffer = [f for f in self.feature_buffer if f.get("episode") != self.episode]
+            dropped_features = before - len(self.feature_buffer)
+
+        if self.last_logged_metrics is not None and self.last_logged_metrics.get("episode") == self.episode:
+            self.last_logged_metrics = None
+
+        if dropped_metrics > 0 or dropped_features > 0:
+            logger.info(
+                "Discarded buffered logs for episode %s: metrics=%s, features=%s",
+                self.episode,
+                dropped_metrics,
+                dropped_features,
+            )
+
+        return dropped_metrics, dropped_features
+
     def flush_metrics(self):
         if not self.metrics_buffer or self.output_dir is None:
             return

@@ -219,7 +219,7 @@ def load_action_entropy_with_fallback(
     entropy_npz_path: Path,
     episode_ranges: list[tuple[int, int]] | None = None,
     trim_episode_frames: int = 30,
-) -> tuple[np.ndarray, str]:
+) -> tuple[np.ndarray | None, str | None]:
     try:
         arr = load_action_entropy(metrics_path, trim_episode_frames=trim_episode_frames)
         return arr, "failure_metrics.jsonl"
@@ -240,10 +240,12 @@ def load_action_entropy_with_fallback(
             )
             return arr, "meta/action_entropy.npz"
         except Exception as npz_exc:
-            raise RuntimeError(
-                "Failed to load action entropy from both failure_metrics.jsonl and npz fallback. "
-                f"jsonl_error={jsonl_exc}; npz_error={npz_exc}"
-            ) from npz_exc
+            print(
+                "[WARN] Failed to load action entropy from both failure_metrics.jsonl "
+                f"and npz fallback. jsonl_error={jsonl_exc}; npz_error={npz_exc}"
+            )
+            print("[WARN] Skipping action entropy safe-threshold computation.")
+            return None, None
 
 
 def compute_cp_threshold(calibration_scores: np.ndarray, alpha: float) -> tuple[float, float, int]:
@@ -571,12 +573,19 @@ def main() -> None:
         episode_ranges=episode_ranges,
         trim_episode_frames=args.trim_episode_frames,
     )
-    ae_safe_threshold, p_count, ae_total = compute_action_entropy_safe_threshold(
-        action_entropies,
-        percentile=args.entropy_percentile,
-        min_cluster_size=args.entropy_min_cluster_size,
-        min_samples=args.entropy_min_samples,
-    )
+
+    ae_safe_threshold: float | None = None
+    p_count: int | None = None
+    ae_total: int | None = None
+    if action_entropies is not None:
+        ae_safe_threshold, p_count, ae_total = compute_action_entropy_safe_threshold(
+            action_entropies,
+            percentile=args.entropy_percentile,
+            min_cluster_size=args.entropy_min_cluster_size,
+            min_samples=args.entropy_min_samples,
+        )
+    else:
+        print("[WARN] action_entropy unavailable. Will not update metrics.action_entropy.safe_threshold.")
 
     print(f"repo_id: {args.repo_id}")
     print(f"samples (n): {n}")
@@ -584,10 +593,19 @@ def main() -> None:
     print(f"trim_episode_frames: {args.trim_episode_frames}")
     print(f"q_level: {q_level}")
     print(f"cp_threshold: {cp_threshold}")
-    print(f"action_entropy_source: {action_entropy_source}")
-    print(f"action_entropy_samples: {ae_total}")
-    print(f"action_entropy_precision_set_samples: {p_count}")
-    print(f"action_entropy_safe_threshold_p{args.entropy_percentile}: {ae_safe_threshold}")
+    if (
+        action_entropy_source is not None
+        and ae_safe_threshold is not None
+        and ae_total is not None
+        and p_count is not None
+    ):
+        print(f"action_entropy_source: {action_entropy_source}")
+        print(f"action_entropy_samples: {ae_total}")
+        print(f"action_entropy_precision_set_samples: {p_count}")
+        print(f"action_entropy_safe_threshold_p{args.entropy_percentile}: {ae_safe_threshold}")
+    else:
+        print("action_entropy_source: unavailable")
+        print("action_entropy_safe_threshold: skipped")
     if not record_config_path.exists():
         print(
             f"❌ record_config.json not found at {record_config_path}. Cannot write CP threshold without it."
@@ -598,7 +616,13 @@ def main() -> None:
     failure_handling_path = pretrained_path / "failure_handling.json"
     config = load_or_create_failure_handling_config(failure_handling_path)
     _set_cp_threshold(config, cp_threshold)
-    _set_action_entropy_safe_threshold(config, ae_safe_threshold)
+    if ae_safe_threshold is not None:
+        _set_action_entropy_safe_threshold(config, ae_safe_threshold)
+    else:
+        print(
+            "[WARN] Keep existing metrics.action_entropy.safe_threshold in failure_handling.json "
+            "(or default value if newly created config)."
+        )
 
     demo_video_path = export_first_episode_video(
         repo_id=args.repo_id,
