@@ -60,7 +60,7 @@ class ActionEntropyConfig(BaseMetricConfig):
             required before computing entropy/max-diff.
     """
 
-    enabled: bool = False
+    enabled: bool = True
     safe_threshold: float = -1.0
     min_bandwidth: float = 1e-5
     min_density: float = 1e-35

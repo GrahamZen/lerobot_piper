@@ -1023,7 +1023,15 @@ def visualize_dataset(
             if concatenated_arr is not None:
                 image_cache[i] = rr.Image(concatenated_arr)
 
-            old_keys = [k for k in list(image_cache.keys()) if k < i - 150]
+            protected_checkpoint_steps: set[int] = set()
+            if failure_metrics:
+                protected_checkpoint_steps = {
+                    int(cp_step) for cp_step in recent_checkpoints_by_step.get(i, [])[-5:]
+                }
+
+            old_keys = [
+                k for k in list(image_cache.keys()) if k < i - 150 and k not in protected_checkpoint_steps
+            ]
             for k in old_keys:
                 del image_cache[k]
 

@@ -233,7 +233,10 @@ def replay_checkpoint_series(
 
     replay_cfg = deepcopy(config)
     replay_cfg.enable_failure_handling = True
-    metrics_engine = FailureMetrics(config=replay_cfg, output_dir=None)
+    # Keep failure detection fixed on temporal_disagreement smoothed signal.
+    td_engine = FailureMetrics(config=replay_cfg, output_dir=None)
+    # Checkpoint selection can follow checkpoint_metric_source.
+    checkpoint_engine = FailureMetrics(config=replay_cfg, output_dir=None)
     checkpoint_metric_source = str(replay_cfg.checkpoint_metric_source).strip().lower()
 
     steps = sorted(failure_metrics.keys())
@@ -272,13 +275,14 @@ def replay_checkpoint_series(
                 and int(step) >= episode_bounds[current_episode_idx][1]
             ):
                 current_episode_idx += 1
-                metrics_engine = FailureMetrics(config=replay_cfg, output_dir=None)
+                td_engine = FailureMetrics(config=replay_cfg, output_dir=None)
+                checkpoint_engine = FailureMetrics(config=replay_cfg, output_dir=None)
                 checkpoint_history = []
                 checkpoint_set_in_episode = set()
 
         if bool(failure_metrics[step].get("is_recovery_wait", False)):
             detect_failure_by_step[int(step)] = False
-            smoothed_by_step[int(step)] = float(metrics_engine.latest_smoothed_disagreement)
+            smoothed_by_step[int(step)] = float(td_engine.latest_smoothed_disagreement)
 
             safe_checkpoint = float("nan")
             for cp in reversed(checkpoint_history):
@@ -294,18 +298,25 @@ def replay_checkpoint_series(
         disagreement = float(row.get("temporal_disagreement", 0.0))
         checkpoint_metric = _checkpoint_metric_from_row(row, checkpoint_metric_source)
 
-        metrics_engine.process_step = int(step)
-        metrics_engine.latest_temporal_disagreement = disagreement
-        metrics_engine.append_state(
+        td_engine.process_step = int(step)
+        td_engine.latest_temporal_disagreement = disagreement
+        td_engine.append_state(
+            torch.zeros(1, dtype=torch.float32),
+            batch=None,
+            checkpoint_metric=disagreement,
+        )
+        detect_failure_by_step[int(step)] = bool(td_engine.detect_failure())
+        smoothed_by_step[int(step)] = float(td_engine.latest_smoothed_disagreement)
+
+        checkpoint_engine.process_step = int(step)
+        checkpoint_engine.latest_temporal_disagreement = disagreement
+        checkpoint_engine.append_state(
             torch.zeros(1, dtype=torch.float32),
             batch=None,
             checkpoint_metric=checkpoint_metric,
         )
-        detect_failure_by_step[int(step)] = bool(metrics_engine.detect_failure())
 
-        smoothed_by_step[int(step)] = float(metrics_engine.latest_smoothed_disagreement)
-
-        queue_steps = [int(cp_step) for cp_step, _, _ in metrics_engine.checkpoint_action_queue]
+        queue_steps = [int(cp_step) for cp_step, _, _ in checkpoint_engine.checkpoint_action_queue]
         for cp_step in queue_steps:
             checkpoint_set.add(cp_step)
             if cp_step not in checkpoint_set_in_episode:
