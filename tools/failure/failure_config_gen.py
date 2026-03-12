@@ -19,9 +19,9 @@ This script:
 from __future__ import annotations
 
 import argparse
-import importlib
 import io
 import json
+import sys
 from contextlib import suppress
 from pathlib import Path
 
@@ -29,6 +29,12 @@ import imageio
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
+
+# Ensure the directory containing this script is on sys.path so that
+# metrics_compute can be imported regardless of how the script is invoked.
+sys.path.insert(0, str(Path(__file__).parent))
+
+from metrics_compute import compute_action_entropy_safe_threshold, compute_cp_threshold
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
@@ -156,17 +162,48 @@ def load_temporal_disagreement(metrics_path: Path, trim_episode_frames: int = 30
     return _extract_numeric_metric(rows, "temporal_disagreement", metrics_path)
 
 
-def load_action_entropy(metrics_path: Path, trim_episode_frames: int = 30) -> np.ndarray:
+def load_action_entropy(metrics_path: Path, trim_episode_frames: int = 30) -> list[np.ndarray]:
     rows = _load_metrics_rows(metrics_path)
-    rows = _trim_metrics_rows_by_episode(rows, trim_episode_frames)
-    return _extract_numeric_metric(rows, "action_entropy", metrics_path)
+
+    grouped_rows: dict[int, list[dict]] = {}
+    for row in rows:
+        episode = row.get("episode", 0)
+        if not isinstance(episode, int):
+            episode = 0
+        grouped_rows.setdefault(int(episode), []).append(row)
+
+    episodes_entropies = []
+    for episode in sorted(grouped_rows):
+        episode_rows = grouped_rows[episode]
+        if trim_episode_frames > 0 and len(episode_rows) <= 2 * trim_episode_frames:
+            continue
+        if trim_episode_frames > 0:
+            episode_rows = episode_rows[trim_episode_frames:-trim_episode_frames]
+
+        scores = []
+        for _line_no, row in enumerate(episode_rows, start=1):
+            value = row.get("action_entropy")
+            if value is None:
+                continue
+            if not isinstance(value, (int, float)):
+                continue
+            if np.isfinite(value):
+                scores.append(float(value))
+
+        if scores:
+            episodes_entropies.append(np.array(scores, dtype=np.float64))
+
+    if not episodes_entropies:
+        raise ValueError(f"No valid action_entropy values found in {metrics_path}")
+
+    return episodes_entropies
 
 
 def load_action_entropy_from_npz(
     npz_path: Path,
     episode_ranges: list[tuple[int, int]] | None = None,
     trim_episode_frames: int = 30,
-) -> np.ndarray:
+) -> list[np.ndarray]:
     if not npz_path.exists():
         raise FileNotFoundError(f"action_entropy.npz not found: {npz_path}")
 
@@ -197,21 +234,33 @@ def load_action_entropy_from_npz(
                 f"{step_arr.shape[0]} vs {entropy_arr.shape[0]}"
             )
 
-    if episode_ranges and trim_episode_frames > 0 and step_arr is not None:
-        keep_mask = np.zeros(step_arr.shape[0], dtype=bool)
+    episodes_entropies = []
+
+    if episode_ranges and step_arr is not None:
         for from_idx, to_idx in episode_ranges:
-            inner_start = int(from_idx) + trim_episode_frames
-            inner_end = int(to_idx) - trim_episode_frames
+            inner_start = int(from_idx)
+            inner_end = int(to_idx)
+            if trim_episode_frames > 0:
+                inner_start += trim_episode_frames
+                inner_end -= trim_episode_frames
             if inner_start >= inner_end:
                 continue
-            keep_mask |= (step_arr >= inner_start) & (step_arr < inner_end)
-        entropy_arr = entropy_arr[keep_mask]
+            keep_mask = (step_arr >= inner_start) & (step_arr < inner_end)
+            ep_arr = entropy_arr[keep_mask]
+            ep_arr = ep_arr[np.isfinite(ep_arr)]
+            if ep_arr.size > 0:
+                episodes_entropies.append(ep_arr)
+    else:
+        if trim_episode_frames > 0 and entropy_arr.size > 2 * trim_episode_frames:
+            entropy_arr = entropy_arr[trim_episode_frames:-trim_episode_frames]
+        ep_arr = entropy_arr[np.isfinite(entropy_arr)]
+        if ep_arr.size > 0:
+            episodes_entropies.append(ep_arr)
 
-    entropy_arr = entropy_arr[np.isfinite(entropy_arr)]
-    if entropy_arr.size == 0:
+    if not episodes_entropies:
         raise ValueError(f"No finite entropy values found in {npz_path}")
 
-    return entropy_arr
+    return episodes_entropies
 
 
 def load_action_entropy_with_fallback(
@@ -219,7 +268,7 @@ def load_action_entropy_with_fallback(
     entropy_npz_path: Path,
     episode_ranges: list[tuple[int, int]] | None = None,
     trim_episode_frames: int = 30,
-) -> tuple[np.ndarray | None, str | None]:
+) -> tuple[list[np.ndarray] | None, str | None]:
     try:
         arr = load_action_entropy(metrics_path, trim_episode_frames=trim_episode_frames)
         return arr, "failure_metrics.jsonl"
@@ -234,9 +283,10 @@ def load_action_entropy_with_fallback(
                 episode_ranges=episode_ranges,
                 trim_episode_frames=trim_episode_frames,
             )
+            total_samples = sum(a.size for a in arr)
             print(
                 "[INFO] Loaded action_entropy from npz fallback. "
-                f"source={entropy_npz_path}, samples={arr.size}"
+                f"source={entropy_npz_path}, samples={total_samples}"
             )
             return arr, "meta/action_entropy.npz"
         except Exception as npz_exc:
@@ -246,62 +296,6 @@ def load_action_entropy_with_fallback(
             )
             print("[WARN] Skipping action entropy safe-threshold computation.")
             return None, None
-
-
-def compute_cp_threshold(calibration_scores: np.ndarray, alpha: float) -> tuple[float, float, int]:
-    if not 0 < alpha < 1:
-        raise ValueError(f"alpha must be in (0, 1), got {alpha}")
-
-    n = len(calibration_scores)
-    q_level = float(np.ceil((n + 1) * (1 - alpha)) / n)
-    q_level = min(q_level, 1.0)
-    cp_threshold = float(np.quantile(calibration_scores, q_level))
-    return cp_threshold, q_level, n
-
-
-def compute_action_entropy_safe_threshold(
-    entropies: np.ndarray,
-    percentile: float,
-    min_cluster_size: int,
-    min_samples: int,
-) -> tuple[float, int, int]:
-    try:
-        sklearn_cluster = importlib.import_module("sklearn.cluster")
-        sklearn_preprocessing = importlib.import_module("sklearn.preprocessing")
-    except Exception as exc:
-        raise ImportError(
-            "scikit-learn is required to compute action entropy safe threshold. "
-            "Please install scikit-learn in the current environment."
-        ) from exc
-
-    hdbscan = sklearn_cluster.HDBSCAN
-    standard_scaler = sklearn_preprocessing.StandardScaler
-
-    if entropies.ndim != 1:
-        raise ValueError(f"entropies must be a 1D array, got shape {entropies.shape}")
-    if entropies.size == 0:
-        raise ValueError("entropies is empty")
-    if not 0 < percentile <= 100:
-        raise ValueError(f"entropy_percentile must be in (0, 100], got {percentile}")
-    if min_cluster_size < 2:
-        raise ValueError(f"entropy_min_cluster_size must be >= 2, got {min_cluster_size}")
-    if min_samples < 1:
-        raise ValueError(f"entropy_min_samples must be >= 1, got {min_samples}")
-
-    all_entropies = entropies.reshape(-1, 1)
-    scaler = standard_scaler()
-    normalized_entropies = scaler.fit_transform(all_entropies)
-
-    clusterer = hdbscan(min_cluster_size=min_cluster_size, min_samples=min_samples)
-    labels = clusterer.fit_predict(normalized_entropies)
-
-    precision_set_entropies = all_entropies[labels >= 0]
-    if precision_set_entropies.size == 0:
-        # Fallback when all points are considered noise: use global percentile.
-        precision_set_entropies = all_entropies
-
-    safe_threshold = float(np.percentile(precision_set_entropies, percentile))
-    return safe_threshold, int(precision_set_entropies.size), int(all_entropies.size)
 
 
 def read_record_config(record_config_path: Path) -> dict:
@@ -583,6 +577,7 @@ def main() -> None:
             percentile=args.entropy_percentile,
             min_cluster_size=args.entropy_min_cluster_size,
             min_samples=args.entropy_min_samples,
+            plot=False,
         )
     else:
         print("[WARN] action_entropy unavailable. Will not update metrics.action_entropy.safe_threshold.")
