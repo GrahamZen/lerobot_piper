@@ -324,6 +324,7 @@ def load_or_create_failure_handling_config(failure_handling_path: Path) -> dict:
         "enable_failure_handling": False,
         "flush_metrics_every_step": False,
         "checkpoint_queue_size": 5,
+        "checkpoint_metric_source": "temporal_disagreement",
         "metrics": {
             "temporal_disagreement": {
                 "enabled": True,

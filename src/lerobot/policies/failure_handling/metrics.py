@@ -70,6 +70,7 @@ class FailureMetrics:
     ):
         self.config = config
         self.output_dir = output_dir
+        self.checkpoint_metric_source = str(self.config.checkpoint_metric_source).strip().lower()
         self.mu = None
         self.inv_cov = None
         self._policy = None
@@ -105,7 +106,9 @@ class FailureMetrics:
 
         # Online checkpoint state
         td_cfg = self.config.metrics.temporal_disagreement
-        self.recent_disagreements: deque = deque(maxlen=td_cfg.window_size)
+        self.recent_checkpoint_metrics: deque[float] = deque(maxlen=td_cfg.window_size)
+        # Backward-compatible alias: existing temporal-disagreement flow still works.
+        self.recent_disagreements = self.recent_checkpoint_metrics
         self.recent_actions: deque = deque(maxlen=td_cfg.window_size)
         self.recent_steps: deque = deque(maxlen=td_cfg.window_size)
         self.recent_views: deque = deque(maxlen=td_cfg.window_size)
@@ -261,8 +264,11 @@ class FailureMetrics:
         if self.recent_action_chunks and current_step != self.recent_action_chunks[-1][0] + 1:
             self.recent_action_chunks.clear()
 
-        # Register the current chunk
-        self.recent_action_chunks.append((current_step, actions_chunk.detach()))
+        # Register the current chunk (idempotent for repeated calls in same step)
+        if self.recent_action_chunks and self.recent_action_chunks[-1][0] == current_step:
+            self.recent_action_chunks[-1] = (current_step, actions_chunk.detach())
+        else:
+            self.recent_action_chunks.append((current_step, actions_chunk.detach()))
 
         # Discard entries that no longer overlap with the current step
         self.recent_action_chunks = [
@@ -288,6 +294,63 @@ class FailureMetrics:
         )
         max_diff = torch.abs(action_samples - action_samples[0:1]).max()
         return entropy, max_diff
+
+    def get_checkpoint_metric_value(
+        self,
+        *,
+        actions_chunk: torch.Tensor | None = None,
+        target_qpos: torch.Tensor | None = None,
+        actual_qpos: torch.Tensor | None = None,
+        temporal_disagreement: float | torch.Tensor | None = None,
+    ) -> float | torch.Tensor:
+        """Return the metric value used for checkpoint valley detection.
+
+        Controlled by ``FailureConfig.checkpoint_metric_source``.
+        """
+        source = self.checkpoint_metric_source
+
+        if source == "temporal_disagreement":
+            return (
+                self.latest_temporal_disagreement if temporal_disagreement is None else temporal_disagreement
+            )
+
+        if source == "following_error":
+            return self.get_following_error(target_qpos, actual_qpos)
+
+        if source == "attention_entropy":
+            return self.get_attention_entropy()
+
+        if source == "mahalanobis_distance":
+            return self.get_mahalanobis_distance()
+
+        if actions_chunk is None:
+            logger.warning(
+                "checkpoint_metric_source=%s requires actions_chunk, fallback to temporal_disagreement",
+                source,
+            )
+            return (
+                self.latest_temporal_disagreement if temporal_disagreement is None else temporal_disagreement
+            )
+
+        if source == "endpoint_shift":
+            return self.get_endpoint_shift(actions_chunk)
+
+        if source == "action_jerk":
+            return self.get_action_jerk(actions_chunk)
+
+        if source == "action_entropy":
+            entropy, _ = self.get_action_chunk_entropy(actions_chunk)
+            return entropy
+
+        if source == "action_entropy_max_diff":
+            _, max_diff = self.get_action_chunk_entropy(actions_chunk)
+            return max_diff
+
+        logger.warning(
+            "Unknown checkpoint_metric_source=%s, fallback to temporal_disagreement",
+            source,
+        )
+        return self.latest_temporal_disagreement if temporal_disagreement is None else temporal_disagreement
 
     # ------------------------------------------------------------------
     # State tracking and checkpoints
@@ -335,13 +398,31 @@ class FailureMetrics:
                 views[key] = self._clone_tensor_for_checkpoint(value)
         return views
 
-    def update_checkpoint_queue(self, smoothed_window: np.ndarray) -> None:
+    def update_checkpoint_queue(
+        self,
+        smoothed_window: np.ndarray,
+        metric_values: deque[float] | list[float] | np.ndarray | None = None,
+    ) -> None:
         td_cfg = self.config.metrics.temporal_disagreement
         if not td_cfg.enabled:
             return
 
-        total = len(self.recent_disagreements)
+        if metric_values is None:
+            metric_values = self.recent_checkpoint_metrics
+
+        total = len(metric_values)
+        if total == 0:
+            return
+
+        if len(smoothed_window) != total:
+            aligned_len = min(len(smoothed_window), total)
+            if aligned_len == 0:
+                return
+            smoothed_window = smoothed_window[-aligned_len:]
+            total = aligned_len
         eval_idx = total - 1 - td_cfg.eval_delay
+        if eval_idx < 0:
+            return
 
         eval_val = smoothed_window[eval_idx]
         past_vals = smoothed_window[eval_idx - td_cfg.valley_lookback : eval_idx]
@@ -400,7 +481,10 @@ class FailureMetrics:
         return val > td_cfg.cp_threshold
 
     def append_state(
-        self, intended_action: torch.Tensor, batch: dict[str, torch.Tensor] | None = None
+        self,
+        intended_action: torch.Tensor,
+        batch: dict[str, torch.Tensor] | None = None,
+        checkpoint_metric: float | torch.Tensor | None = None,
     ) -> None:
         td_cfg = self.config.metrics.temporal_disagreement
         if not td_cfg.enabled:
@@ -410,19 +494,19 @@ class FailureMetrics:
         self.recent_actions.append(intended_action.detach().clone())
         self.recent_views.append(self._extract_checkpoint_views(batch))
 
-        val = self.latest_temporal_disagreement
+        val = self.latest_temporal_disagreement if checkpoint_metric is None else checkpoint_metric
         if torch.is_tensor(val):
             val = val.item()
-        self.recent_disagreements.append(val)
+        self.recent_checkpoint_metrics.append(float(val))
 
-        disagreements_arr = np.array(self.recent_disagreements, dtype=np.float64)
-        smoothed_window = self._causal_gaussian_series(disagreements_arr, sigma=td_cfg.smoothing_sigma)
+        metric_arr = np.array(self.recent_checkpoint_metrics, dtype=np.float64)
+        smoothed_window = self._causal_gaussian_series(metric_arr, sigma=td_cfg.smoothing_sigma)
         if len(smoothed_window) > 0:
             self.latest_smoothed_disagreement = float(smoothed_window[-1])
 
         min_required = td_cfg.eval_delay + td_cfg.valley_lookback + 1
-        if len(self.recent_disagreements) >= min_required:
-            self.update_checkpoint_queue(smoothed_window)
+        if len(self.recent_checkpoint_metrics) >= min_required:
+            self.update_checkpoint_queue(smoothed_window, metric_values=self.recent_checkpoint_metrics)
 
     def compute_and_log(self, actions_chunk, target_qpos=None, actual_qpos=None, temporal_disagreement=None):
         metrics = {

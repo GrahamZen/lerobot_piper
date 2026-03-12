@@ -87,11 +87,15 @@ class FailureConfig:
     enable_failure_handling: bool = False
     flush_metrics_every_step: bool = False
     checkpoint_queue_size: int = 5
+    checkpoint_metric_source: str = "temporal_disagreement"
 
     metrics: MetricsConfig = field(default_factory=MetricsConfig)
 
     def __post_init__(self):
         self.checkpoint_queue_size = max(1, self.checkpoint_queue_size)
+        self.checkpoint_metric_source = str(self.checkpoint_metric_source).strip().lower()
+        if not self.checkpoint_metric_source:
+            self.checkpoint_metric_source = "temporal_disagreement"
 
     @classmethod
     def from_json(cls, path: str | Path | None) -> "FailureConfig":

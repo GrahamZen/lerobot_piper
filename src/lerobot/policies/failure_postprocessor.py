@@ -114,7 +114,17 @@ class FailurePostprocessor:
             )
 
             if self.config.metrics.temporal_disagreement.enabled:
-                self.metrics.append_state(intended_action, batch=batch)
+                checkpoint_metric = self.metrics.get_checkpoint_metric_value(
+                    actions_chunk=new_actions_chunk,
+                    target_qpos=target_qpos,
+                    actual_qpos=actual_qpos,
+                    temporal_disagreement=self.metrics.latest_temporal_disagreement,
+                )
+                self.metrics.append_state(
+                    intended_action,
+                    batch=batch,
+                    checkpoint_metric=checkpoint_metric,
+                )
 
             if self.config.enable_logging:
                 self.metrics.compute_and_log(

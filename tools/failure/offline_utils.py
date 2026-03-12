@@ -184,6 +184,43 @@ def load_failure_metrics_jsonl(dataset_root: str | Path) -> dict[int, dict[str, 
     return failure_metrics
 
 
+def _checkpoint_metric_from_row(row: dict[str, Any], source: str) -> float:
+    source = str(source).strip().lower()
+
+    key_map = {
+        "temporal_disagreement": "temporal_disagreement",
+        "following_error": "following_error",
+        "attention_entropy": "attention_entropy",
+        "mahalanobis_distance": "mahalanobis_distance",
+        "endpoint_shift": "endpoint_shift",
+        "action_jerk": "action_jerk",
+        "action_entropy": "action_entropy",
+    }
+
+    if source == "action_entropy_max_diff":
+        for key in (
+            "action_entropy_max_diff",
+            "action_entropy_sample_max_diff",
+            "action_sample_max_diff",
+        ):
+            value = row.get(key)
+            if isinstance(value, (int, float)):
+                return float(value)
+        fallback = row.get("temporal_disagreement", 0.0)
+        return float(fallback) if isinstance(fallback, (int, float)) else 0.0
+
+    metric_key = key_map.get(source)
+    if metric_key is None:
+        metric_key = "temporal_disagreement"
+
+    value = row.get(metric_key)
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    fallback = row.get("temporal_disagreement", 0.0)
+    return float(fallback) if isinstance(fallback, (int, float)) else 0.0
+
+
 def replay_checkpoint_series(
     failure_metrics: dict[int, dict[str, Any]],
     config: FailureConfig,
@@ -197,6 +234,7 @@ def replay_checkpoint_series(
     replay_cfg = deepcopy(config)
     replay_cfg.enable_failure_handling = True
     metrics_engine = FailureMetrics(config=replay_cfg, output_dir=None)
+    checkpoint_metric_source = str(replay_cfg.checkpoint_metric_source).strip().lower()
 
     steps = sorted(failure_metrics.keys())
     smoothed_by_step: dict[int, float] = {}
@@ -252,11 +290,17 @@ def replay_checkpoint_series(
             recent_checkpoints_by_step[int(step)] = checkpoint_history[-5:]
             continue
 
-        disagreement = float(failure_metrics[step].get("temporal_disagreement", 0.0))
+        row = failure_metrics[step]
+        disagreement = float(row.get("temporal_disagreement", 0.0))
+        checkpoint_metric = _checkpoint_metric_from_row(row, checkpoint_metric_source)
 
         metrics_engine.process_step = int(step)
         metrics_engine.latest_temporal_disagreement = disagreement
-        metrics_engine.append_state(torch.zeros(1, dtype=torch.float32), batch=None)
+        metrics_engine.append_state(
+            torch.zeros(1, dtype=torch.float32),
+            batch=None,
+            checkpoint_metric=checkpoint_metric,
+        )
         detect_failure_by_step[int(step)] = bool(metrics_engine.detect_failure())
 
         smoothed_by_step[int(step)] = float(metrics_engine.latest_smoothed_disagreement)

@@ -57,6 +57,89 @@ _VLM_EMPTY_IMAGE = np.zeros((16, 16, 3), dtype=np.uint8)
 ACTION_ENTROPY_NPZ_FILENAME = "action_entropy.npz"
 
 
+def _checkpoint_marker_origin_for_source(source: str) -> str:
+    source = str(source).strip().lower()
+    origin_map = {
+        "temporal_disagreement": "metrics/temporal_disagreement_smoothed",
+        "following_error": "metrics/following_error",
+        "attention_entropy": "metrics/attention_entropy",
+        "mahalanobis_distance": "metrics/mahalanobis_distance",
+        "endpoint_shift": "metrics/endpoint_shift",
+        "action_jerk": "metrics/action_jerk",
+        "action_entropy": "metrics/action_entropy_compare/jsonl",
+        "action_entropy_max_diff": "metrics/action_entropy_max_diff_compare/jsonl",
+    }
+    return origin_map.get(source, "metrics/temporal_disagreement_smoothed")
+
+
+def _checkpoint_curve_label_by_origin(checkpoint_origin: str) -> dict[str, str]:
+    labels = {
+        "metrics/temporal_disagreement_smoothed": "Temporal Disagreement Smoothed",
+        "metrics/following_error": "Following Error",
+        "metrics/attention_entropy": "Attention Entropy",
+        "metrics/mahalanobis_distance": "Mahalanobis Distance",
+        "metrics/endpoint_shift": "Endpoint Shift",
+        "metrics/action_jerk": "Action Jerk",
+        "metrics/action_entropy_compare": "Action Entropy (JSONL vs Offline)",
+        "metrics/action_entropy_max_diff_compare": "Action Sample Diversity (JSONL vs Offline)",
+    }
+
+    decorated = {}
+    for origin, label in labels.items():
+        if checkpoint_origin == f"{origin}/jsonl" or checkpoint_origin == origin:
+            decorated[origin] = f"{label} (Checkpoint Source)"
+        else:
+            decorated[origin] = label
+    return decorated
+
+
+def _checkpoint_marker_value_for_step(
+    *,
+    source: str,
+    metric_row: dict,
+    smoothed_td: float,
+    step: int,
+    entropy_jsonl_by_step: dict[int, float],
+    entropy_jsonl_max_diff_by_step: dict[int, float],
+) -> float | None:
+    source = str(source).strip().lower()
+
+    if source == "temporal_disagreement":
+        return float(smoothed_td)
+
+    if source == "action_entropy":
+        value = entropy_jsonl_by_step.get(step)
+        return float(value) if value is not None else None
+
+    if source == "action_entropy_max_diff":
+        value = entropy_jsonl_max_diff_by_step.get(step)
+        if value is None:
+            for key in (
+                "action_entropy_max_diff",
+                "action_entropy_sample_max_diff",
+                "action_sample_max_diff",
+            ):
+                raw = metric_row.get(key)
+                if isinstance(raw, (int, float)):
+                    value = float(raw)
+                    break
+        return float(value) if value is not None else None
+
+    key_map = {
+        "following_error": "following_error",
+        "attention_entropy": "attention_entropy",
+        "mahalanobis_distance": "mahalanobis_distance",
+        "endpoint_shift": "endpoint_shift",
+        "action_jerk": "action_jerk",
+    }
+    metric_key = key_map.get(source)
+    if metric_key is None:
+        return float(smoothed_td)
+
+    value = metric_row.get(metric_key)
+    return float(value) if isinstance(value, (int, float)) else None
+
+
 def _resolve_pretrained_path_from_dataset_root(dataset_root: Path) -> Path | None:
     record_config_path = dataset_root / "meta" / "record_config.json"
     if not record_config_path.exists():
@@ -133,6 +216,47 @@ def _safe_int(value):
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _concatenate_three_camera_images(images_dict: dict, camera_names: list, item: dict) -> np.ndarray | None:
+    """Concatenate left, middle, right camera images horizontally."""
+    # Priority order: left, middle, right
+    priority_names = ["left", "middle", "right"]
+
+    arrays = []
+    for name in priority_names:
+        # Find matching camera
+        matching_cameras = [cam for cam in camera_names if name in cam.lower()]
+        if not matching_cameras:
+            continue
+
+        cam_key = matching_cameras[0]
+        img_key = f"observation.images.{cam_key}"
+
+        if img_key not in item:
+            continue
+
+        img_data = item[img_key]
+        arr = img_data.numpy() if hasattr(img_data, "numpy") else img_data
+
+        # Handle channel-first format
+        if arr.ndim == 3 and arr.shape[0] <= 4:
+            arr = np.transpose(arr, (1, 2, 0))
+
+        # Ensure 3 channels (RGB)
+        if arr.ndim == 3 and arr.shape[2] == 4:
+            arr = arr[:, :, :3]  # Drop alpha channel if present
+
+        arrays.append(arr)
+
+    # Concatenate horizontally if we have at least 2 images
+    if len(arrays) >= 2:
+        concatenated = np.concatenate(arrays, axis=1)
+        return concatenated
+    elif len(arrays) == 1:
+        return arrays[0]
+
+    return None
 
 
 def _build_vlm_record_view(rec_dir: Path, rec_index: int, meta: dict) -> dict:
@@ -470,6 +594,13 @@ def visualize_dataset(
 
     failure_handling_cfg = load_failure_handling_json(dataset.root, required=True)
     failure_cfg = load_failure_config(dataset.root, required=True)
+    checkpoint_metric_source = (
+        str(failure_handling_cfg.get("checkpoint_metric_source", "temporal_disagreement")).strip().lower()
+    )
+    checkpoint_marker_origin = _checkpoint_marker_origin_for_source(checkpoint_metric_source)
+    checkpoint_curve_labels = _checkpoint_curve_label_by_origin(checkpoint_marker_origin)
+    print(f"Checkpoint metric source: {checkpoint_metric_source}")
+    print(f"Checkpoint marker chart: {checkpoint_marker_origin}")
 
     if (
         "metrics" not in failure_handling_cfg
@@ -721,23 +852,35 @@ def visualize_dataset(
                             name="Temporal Disagreement", origin="metrics/temporal_disagreement"
                         ),
                         rrb.TimeSeriesView(
-                            name="Temporal Disagreement Smoothed",
+                            name=checkpoint_curve_labels["metrics/temporal_disagreement_smoothed"],
                             origin="metrics/temporal_disagreement_smoothed",
                         ),
-                        rrb.TimeSeriesView(name="Following Error", origin="metrics/following_error"),
+                        rrb.TimeSeriesView(
+                            name=checkpoint_curve_labels["metrics/following_error"],
+                            origin="metrics/following_error",
+                        ),
                         rrb.TimeSeriesView(
                             name="Previous Checkpoint Step", origin="metrics/previous_checkpoint_step"
                         ),
-                        rrb.TimeSeriesView(name="Attention Entropy", origin="metrics/attention_entropy"),
-                        rrb.TimeSeriesView(name="Endpoint Shift", origin="metrics/endpoint_shift"),
-                        rrb.TimeSeriesView(name="Action Jerk", origin="metrics/action_jerk"),
+                        rrb.TimeSeriesView(
+                            name=checkpoint_curve_labels["metrics/attention_entropy"],
+                            origin="metrics/attention_entropy",
+                        ),
+                        rrb.TimeSeriesView(
+                            name=checkpoint_curve_labels["metrics/endpoint_shift"],
+                            origin="metrics/endpoint_shift",
+                        ),
+                        rrb.TimeSeriesView(
+                            name=checkpoint_curve_labels["metrics/action_jerk"],
+                            origin="metrics/action_jerk",
+                        ),
                         rrb.TimeSeriesView(name="Checkpoint Flag", origin="metrics/checkpoint_flag"),
                         rrb.TimeSeriesView(
-                            name="Action Entropy (JSONL vs Offline)",
+                            name=checkpoint_curve_labels["metrics/action_entropy_compare"],
                             origin="metrics/action_entropy_compare",
                         ),
                         rrb.TimeSeriesView(
-                            name="Action Sample Diversity (JSONL vs Offline)",
+                            name=checkpoint_curve_labels["metrics/action_entropy_max_diff_compare"],
                             origin="metrics/action_entropy_max_diff_compare",
                         ),
                     ),
@@ -759,11 +902,11 @@ def visualize_dataset(
             rrb.Horizontal(
                 rrb.Vertical(
                     rrb.TimeSeriesView(
-                        name="Action Entropy (JSONL vs Offline)",
+                        name=checkpoint_curve_labels["metrics/action_entropy_compare"],
                         origin="metrics/action_entropy_compare",
                     ),
                     rrb.TimeSeriesView(
-                        name="Action Sample Diversity (JSONL vs Offline)",
+                        name=checkpoint_curve_labels["metrics/action_entropy_max_diff_compare"],
                         origin="metrics/action_entropy_max_diff_compare",
                     ),
                 ),
@@ -790,6 +933,12 @@ def visualize_dataset(
                 rr.SeriesPoints(colors=[255, 0, 0], markers="diamond", marker_sizes=5.0),
                 static=True,
             )
+        # Green markers for checkpoint steps in temporal_disagreement_smoothed
+        rr.log(
+            f"{checkpoint_marker_origin}/checkpoint_markers",
+            rr.SeriesPoints(colors=[0, 255, 0], markers="circle", marker_sizes=5.0),
+            static=True,
+        )
 
     if ae_safe_threshold is not None:
         # Red dots for SAFE region (entropy > threshold → robot in free/casual space)
@@ -810,7 +959,6 @@ def visualize_dataset(
     prev_attention_step = None
 
     image_cache = {}
-    was_td_failed = False
 
     for episode_idx in range(total_episodes):
         print(f"Streaming Episode {episode_idx}/{total_episodes}...", end="\r")
@@ -848,8 +996,6 @@ def visualize_dataset(
             if item is None:
                 continue
 
-            main_camera_rr_img = None
-
             for img_key in [k for k in item if "image" in k]:
                 img_data = item[img_key]
                 clean_key = img_key.replace("observation.images.", "")
@@ -872,11 +1018,10 @@ def visualize_dataset(
 
                 rr.log(f"cameras/{clean_key}", rr_img_obj)
 
-                if "middle" in clean_key.lower() or main_camera_rr_img is None:
-                    main_camera_rr_img = rr_img_obj
-
-            if main_camera_rr_img is not None:
-                image_cache[i] = main_camera_rr_img
+            # Create concatenated image for checkpoint display (left, middle, right)
+            concatenated_arr = _concatenate_three_camera_images({}, camera_names, item)
+            if concatenated_arr is not None:
+                image_cache[i] = rr.Image(concatenated_arr)
 
             old_keys = [k for k in list(image_cache.keys()) if k < i - 150]
             for k in old_keys:
@@ -952,12 +1097,29 @@ def visualize_dataset(
                 rr.log("metrics/checkpoint_flag", rr.Scalars(checkpoint_flag_by_step.get(i, 0.0)))
 
                 is_td_failed = i in td_failed_step_set
+                is_checkpoint = checkpoint_flag_by_step.get(i, 0.0) > 0.5
+
                 if is_td_failed:
                     rr.log("metrics/temporal_disagreement_smoothed/failed_markers", rr.Scalars(smooth_td))
                     rr.log(
                         "metrics/previous_checkpoint_step/failed_markers",
                         rr.Scalars(previous_checkpoint_by_step.get(i, np.nan)),
                     )
+
+                if is_checkpoint:
+                    marker_value = _checkpoint_marker_value_for_step(
+                        source=checkpoint_metric_source,
+                        metric_row=m,
+                        smoothed_td=smooth_td,
+                        step=i,
+                        entropy_jsonl_by_step=entropy_jsonl_by_step,
+                        entropy_jsonl_max_diff_by_step=entropy_jsonl_max_diff_by_step,
+                    )
+                    if marker_value is not None:
+                        rr.log(
+                            f"{checkpoint_marker_origin}/checkpoint_markers",
+                            rr.Scalars(marker_value),
+                        )
 
                 if use_vlm_panels:
                     matched_record = _select_vlm_record_for_step(
@@ -972,14 +1134,14 @@ def visualize_dataset(
                     else:
                         _log_vlm_record_windows(None)
                 else:
-                    if is_td_failed:
+                    # Always check checkpoint queue and display latest 5 if available
+                    cps = recent_checkpoints_by_step.get(i, [])
+                    if cps:
                         _log_checkpoint_windows(image_cache, recent_checkpoints_by_step, i)
-                        was_td_failed = True
                     else:
-                        if was_td_failed:
-                            for cp_idx in range(5):
-                                rr.log(f"checkpoints/cp_{cp_idx}", rr.Clear(recursive=False))
-                            was_td_failed = False
+                        # Clear checkpoint display if no checkpoints in queue
+                        for cp_idx in range(5):
+                            rr.log(f"checkpoints/cp_{cp_idx}", rr.Clear(recursive=False))
 
     print("\nDone streaming to Rerun.")
 
