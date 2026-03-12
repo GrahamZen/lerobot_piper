@@ -238,6 +238,20 @@ def replay_checkpoint_series(
                 checkpoint_history = []
                 checkpoint_set_in_episode = set()
 
+        if bool(failure_metrics[step].get("is_recovery_wait", False)):
+            detect_failure_by_step[int(step)] = False
+            smoothed_by_step[int(step)] = float(metrics_engine.latest_smoothed_disagreement)
+
+            safe_checkpoint = float("nan")
+            for cp in reversed(checkpoint_history):
+                if int(step) - cp >= safety_margin:
+                    safe_checkpoint = float(cp)
+                    break
+
+            previous_checkpoint_by_step[int(step)] = safe_checkpoint
+            recent_checkpoints_by_step[int(step)] = checkpoint_history[-5:]
+            continue
+
         disagreement = float(failure_metrics[step].get("temporal_disagreement", 0.0))
 
         metrics_engine.process_step = int(step)

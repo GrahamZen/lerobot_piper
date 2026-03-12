@@ -103,6 +103,7 @@ dependencies = [
     "ipykernel>=7.2.0",
     "scipy>=1.14.1",
     "google-genai>=1.65.0",
+    "scikit-learn>=1.7.2",
 ]
 
 # Optional dependencies

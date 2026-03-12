@@ -50,6 +50,9 @@ class ActionEntropyConfig(BaseMetricConfig):
 
     Attributes:
         enabled: Whether to compute and log action entropy each step.
+        safe_threshold: Upper bound of "precision-set" entropy estimated from
+            successful calibration trajectories. Runtime entropy larger than
+            this value is considered safely outside precision behavior.
         min_bandwidth: Lower bound for Silverman's rule bandwidth, prevents
             degenerate kernels when consecutive predictions are nearly identical.
         min_density: Lower bound for KDE density before taking log, avoids -inf.
@@ -58,6 +61,7 @@ class ActionEntropyConfig(BaseMetricConfig):
     """
 
     enabled: bool = False
+    safe_threshold: float = -1.0
     min_bandwidth: float = 1e-5
     min_density: float = 1e-35
     min_overlap_samples: int = 3

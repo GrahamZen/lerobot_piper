@@ -6,17 +6,20 @@ This script:
 2) Computes CP threshold for temporal_disagreement:
          q_level = ceil((n + 1) * (1 - alpha)) / n
          cp_threshold = quantile(scores, min(q_level, 1.0))
-3) Loads <repo_id>/meta/record_config.json and resolves pretrained_path.
-4) Creates or updates <pretrained_path>/failure_handling.json:
+3) Loads action entropy from <repo_id>/failure_metrics.jsonl when available,
+   otherwise falls back to <repo_id>/meta/action_entropy.npz.
+4) Loads <repo_id>/meta/record_config.json and resolves pretrained_path.
+5) Creates or updates <pretrained_path>/failure_handling.json:
     - If missing, initialize from tools/failure/examples/pick_up_markers/failure_handling.json.
     - Always set metrics.temporal_disagreement.cp_threshold.
-5) Exports first episode (episode_index=0) demo video to pretrained_path and updates
+6) Exports first episode (episode_index=0) demo video to pretrained_path and updates
     demo_video_path in failure_handling.json with the absolute video path.
 """
 
 from __future__ import annotations
 
 import argparse
+import importlib
 import io
 import json
 from contextlib import suppress
@@ -57,14 +60,38 @@ def parse_args() -> argparse.Namespace:
         default=Path("~/.cache/huggingface/lerobot").expanduser(),
         help="Lerobot cache root. Default: ~/.cache/huggingface/lerobot",
     )
+    parser.add_argument(
+        "--entropy_percentile",
+        type=float,
+        default=95.0,
+        help="Percentile on clustered precision set for action entropy safe threshold. Default: 95",
+    )
+    parser.add_argument(
+        "--entropy_min_cluster_size",
+        type=int,
+        default=50,
+        help="HDBSCAN min_cluster_size for action entropy clustering. Default: 50",
+    )
+    parser.add_argument(
+        "--entropy_min_samples",
+        type=int,
+        default=10,
+        help="HDBSCAN min_samples for action entropy clustering. Default: 10",
+    )
+    parser.add_argument(
+        "--trim_episode_frames",
+        type=int,
+        default=30,
+        help="Ignore the first and last N frames of each episode when extracting thresholds. Default: 30",
+    )
     return parser.parse_args()
 
 
-def load_temporal_disagreement(metrics_path: Path) -> np.ndarray:
+def _load_metrics_rows(metrics_path: Path) -> list[dict]:
     if not metrics_path.exists():
         raise FileNotFoundError(f"failure_metrics.jsonl not found: {metrics_path}")
 
-    scores = []
+    rows: list[dict] = []
     with metrics_path.open("r", encoding="utf-8") as file:
         for line_no, line in enumerate(file, start=1):
             line = line.strip()
@@ -75,20 +102,148 @@ def load_temporal_disagreement(metrics_path: Path) -> np.ndarray:
             except json.JSONDecodeError as exc:
                 raise ValueError(f"Invalid JSON in {metrics_path} at line {line_no}") from exc
 
-            value = row.get("temporal_disagreement")
-            if value is None:
-                continue
-            if not isinstance(value, (int, float)):
-                raise TypeError(
-                    f"temporal_disagreement must be numeric, got {type(value).__name__} "
-                    f"at line {line_no} in {metrics_path}"
-                )
+            if not isinstance(row, dict):
+                raise TypeError(f"Expected JSON object at line {line_no} in {metrics_path}")
+            rows.append(row)
+
+    return rows
+
+
+def _trim_metrics_rows_by_episode(rows: list[dict], trim_episode_frames: int) -> list[dict]:
+    if trim_episode_frames <= 0 or not rows:
+        return rows
+
+    grouped_rows: dict[int, list[dict]] = {}
+    for row in rows:
+        episode = row.get("episode")
+        if not isinstance(episode, int):
+            return rows
+        grouped_rows.setdefault(int(episode), []).append(row)
+
+    trimmed_rows: list[dict] = []
+    for episode in sorted(grouped_rows):
+        episode_rows = grouped_rows[episode]
+        if len(episode_rows) <= 2 * trim_episode_frames:
+            continue
+        trimmed_rows.extend(episode_rows[trim_episode_frames:-trim_episode_frames])
+
+    return trimmed_rows
+
+
+def _extract_numeric_metric(rows: list[dict], metric_key: str, metrics_path: Path) -> np.ndarray:
+    scores = []
+    for line_no, row in enumerate(rows, start=1):
+        value = row.get(metric_key)
+        if value is None:
+            continue
+        if not isinstance(value, (int, float)):
+            raise TypeError(
+                f"{metric_key} must be numeric, got {type(value).__name__} "
+                f"at filtered row {line_no} in {metrics_path}"
+            )
+        if np.isfinite(value):
             scores.append(float(value))
 
     if not scores:
-        raise ValueError(f"No valid temporal_disagreement values found in {metrics_path}")
+        raise ValueError(f"No valid {metric_key} values found in {metrics_path}")
 
     return np.array(scores, dtype=np.float64)
+
+
+def load_temporal_disagreement(metrics_path: Path, trim_episode_frames: int = 30) -> np.ndarray:
+    rows = _load_metrics_rows(metrics_path)
+    rows = _trim_metrics_rows_by_episode(rows, trim_episode_frames)
+    return _extract_numeric_metric(rows, "temporal_disagreement", metrics_path)
+
+
+def load_action_entropy(metrics_path: Path, trim_episode_frames: int = 30) -> np.ndarray:
+    rows = _load_metrics_rows(metrics_path)
+    rows = _trim_metrics_rows_by_episode(rows, trim_episode_frames)
+    return _extract_numeric_metric(rows, "action_entropy", metrics_path)
+
+
+def load_action_entropy_from_npz(
+    npz_path: Path,
+    episode_ranges: list[tuple[int, int]] | None = None,
+    trim_episode_frames: int = 30,
+) -> np.ndarray:
+    if not npz_path.exists():
+        raise FileNotFoundError(f"action_entropy.npz not found: {npz_path}")
+
+    try:
+        data = np.load(npz_path, allow_pickle=True)
+    except Exception as exc:
+        raise ValueError(f"Failed to read npz file: {npz_path}") from exc
+
+    key_candidates = ("entropy", "action_entropy", "entropies")
+    entropy_arr = None
+    for key in key_candidates:
+        if key in data.files:
+            entropy_arr = np.asarray(data[key], dtype=np.float64).reshape(-1)
+            break
+
+    if entropy_arr is None:
+        raise KeyError(
+            f"None of expected entropy keys {key_candidates} found in {npz_path}. "
+            f"available keys: {list(data.files)}"
+        )
+
+    step_arr = None
+    if "step" in data.files:
+        step_arr = np.asarray(data["step"], dtype=np.int64).reshape(-1)
+        if step_arr.shape[0] != entropy_arr.shape[0]:
+            raise ValueError(
+                f"step and entropy length mismatch in {npz_path}: "
+                f"{step_arr.shape[0]} vs {entropy_arr.shape[0]}"
+            )
+
+    if episode_ranges and trim_episode_frames > 0 and step_arr is not None:
+        keep_mask = np.zeros(step_arr.shape[0], dtype=bool)
+        for from_idx, to_idx in episode_ranges:
+            inner_start = int(from_idx) + trim_episode_frames
+            inner_end = int(to_idx) - trim_episode_frames
+            if inner_start >= inner_end:
+                continue
+            keep_mask |= (step_arr >= inner_start) & (step_arr < inner_end)
+        entropy_arr = entropy_arr[keep_mask]
+
+    entropy_arr = entropy_arr[np.isfinite(entropy_arr)]
+    if entropy_arr.size == 0:
+        raise ValueError(f"No finite entropy values found in {npz_path}")
+
+    return entropy_arr
+
+
+def load_action_entropy_with_fallback(
+    metrics_path: Path,
+    entropy_npz_path: Path,
+    episode_ranges: list[tuple[int, int]] | None = None,
+    trim_episode_frames: int = 30,
+) -> tuple[np.ndarray, str]:
+    try:
+        arr = load_action_entropy(metrics_path, trim_episode_frames=trim_episode_frames)
+        return arr, "failure_metrics.jsonl"
+    except (FileNotFoundError, ValueError, KeyError) as jsonl_exc:
+        print(
+            "[WARN] action_entropy not available in failure_metrics.jsonl, "
+            f"fallback to npz: {entropy_npz_path}"
+        )
+        try:
+            arr = load_action_entropy_from_npz(
+                entropy_npz_path,
+                episode_ranges=episode_ranges,
+                trim_episode_frames=trim_episode_frames,
+            )
+            print(
+                "[INFO] Loaded action_entropy from npz fallback. "
+                f"source={entropy_npz_path}, samples={arr.size}"
+            )
+            return arr, "meta/action_entropy.npz"
+        except Exception as npz_exc:
+            raise RuntimeError(
+                "Failed to load action entropy from both failure_metrics.jsonl and npz fallback. "
+                f"jsonl_error={jsonl_exc}; npz_error={npz_exc}"
+            ) from npz_exc
 
 
 def compute_cp_threshold(calibration_scores: np.ndarray, alpha: float) -> tuple[float, float, int]:
@@ -100,6 +255,51 @@ def compute_cp_threshold(calibration_scores: np.ndarray, alpha: float) -> tuple[
     q_level = min(q_level, 1.0)
     cp_threshold = float(np.quantile(calibration_scores, q_level))
     return cp_threshold, q_level, n
+
+
+def compute_action_entropy_safe_threshold(
+    entropies: np.ndarray,
+    percentile: float,
+    min_cluster_size: int,
+    min_samples: int,
+) -> tuple[float, int, int]:
+    try:
+        sklearn_cluster = importlib.import_module("sklearn.cluster")
+        sklearn_preprocessing = importlib.import_module("sklearn.preprocessing")
+    except Exception as exc:
+        raise ImportError(
+            "scikit-learn is required to compute action entropy safe threshold. "
+            "Please install scikit-learn in the current environment."
+        ) from exc
+
+    hdbscan = sklearn_cluster.HDBSCAN
+    standard_scaler = sklearn_preprocessing.StandardScaler
+
+    if entropies.ndim != 1:
+        raise ValueError(f"entropies must be a 1D array, got shape {entropies.shape}")
+    if entropies.size == 0:
+        raise ValueError("entropies is empty")
+    if not 0 < percentile <= 100:
+        raise ValueError(f"entropy_percentile must be in (0, 100], got {percentile}")
+    if min_cluster_size < 2:
+        raise ValueError(f"entropy_min_cluster_size must be >= 2, got {min_cluster_size}")
+    if min_samples < 1:
+        raise ValueError(f"entropy_min_samples must be >= 1, got {min_samples}")
+
+    all_entropies = entropies.reshape(-1, 1)
+    scaler = standard_scaler()
+    normalized_entropies = scaler.fit_transform(all_entropies)
+
+    clusterer = hdbscan(min_cluster_size=min_cluster_size, min_samples=min_samples)
+    labels = clusterer.fit_predict(normalized_entropies)
+
+    precision_set_entropies = all_entropies[labels >= 0]
+    if precision_set_entropies.size == 0:
+        # Fallback when all points are considered noise: use global percentile.
+        precision_set_entropies = all_entropies
+
+    safe_threshold = float(np.percentile(precision_set_entropies, percentile))
+    return safe_threshold, int(precision_set_entropies.size), int(all_entropies.size)
 
 
 def read_record_config(record_config_path: Path) -> dict:
@@ -155,6 +355,7 @@ def load_or_create_failure_handling_config(failure_handling_path: Path) -> dict:
             },
             "action_entropy": {
                 "enabled": True,
+                "safe_threshold": -1.0,
                 "min_bandwidth": 1e-5,
                 "min_density": 1e-35,
                 "min_overlap_samples": 3,
@@ -167,6 +368,12 @@ def _set_cp_threshold(config: dict, cp_threshold: float) -> None:
     metrics = config.setdefault("metrics", {})
     td_cfg = metrics.setdefault("temporal_disagreement", {})
     td_cfg["cp_threshold"] = float(cp_threshold)
+
+
+def _set_action_entropy_safe_threshold(config: dict, safe_threshold: float) -> None:
+    metrics = config.setdefault("metrics", {})
+    ae_cfg = metrics.setdefault("action_entropy", {})
+    ae_cfg["safe_threshold"] = float(safe_threshold)
 
 
 def _save_failure_handling_config(failure_handling_path: Path, config: dict) -> None:
@@ -342,16 +549,44 @@ def main() -> None:
 
     repo_dir = args.cache_root / args.repo_id
     metrics_path = repo_dir / "failure_metrics.jsonl"
+    entropy_npz_path = repo_dir / "meta" / "action_entropy.npz"
     record_config_path = repo_dir / "meta" / "record_config.json"
+    dataset = LeRobotDataset(args.repo_id, root=repo_dir)
+    if dataset.meta.episodes is None:
+        from lerobot.datasets.utils import load_episodes
 
-    calibration_scores = load_temporal_disagreement(metrics_path)
+        dataset.meta.episodes = load_episodes(dataset.root)
+    episode_ranges = [
+        _get_episode_bounds(dataset, episode_index=i) for i in range(len(dataset.meta.episodes))
+    ]
+
+    calibration_scores = load_temporal_disagreement(
+        metrics_path, trim_episode_frames=args.trim_episode_frames
+    )
     cp_threshold, q_level, n = compute_cp_threshold(calibration_scores, args.alpha)
+    action_entropies, action_entropy_source = load_action_entropy_with_fallback(
+        metrics_path,
+        entropy_npz_path,
+        episode_ranges=episode_ranges,
+        trim_episode_frames=args.trim_episode_frames,
+    )
+    ae_safe_threshold, p_count, ae_total = compute_action_entropy_safe_threshold(
+        action_entropies,
+        percentile=args.entropy_percentile,
+        min_cluster_size=args.entropy_min_cluster_size,
+        min_samples=args.entropy_min_samples,
+    )
 
     print(f"repo_id: {args.repo_id}")
     print(f"samples (n): {n}")
     print(f"alpha: {args.alpha}")
+    print(f"trim_episode_frames: {args.trim_episode_frames}")
     print(f"q_level: {q_level}")
     print(f"cp_threshold: {cp_threshold}")
+    print(f"action_entropy_source: {action_entropy_source}")
+    print(f"action_entropy_samples: {ae_total}")
+    print(f"action_entropy_precision_set_samples: {p_count}")
+    print(f"action_entropy_safe_threshold_p{args.entropy_percentile}: {ae_safe_threshold}")
     if not record_config_path.exists():
         print(
             f"❌ record_config.json not found at {record_config_path}. Cannot write CP threshold without it."
@@ -362,6 +597,7 @@ def main() -> None:
     failure_handling_path = pretrained_path / "failure_handling.json"
     config = load_or_create_failure_handling_config(failure_handling_path)
     _set_cp_threshold(config, cp_threshold)
+    _set_action_entropy_safe_threshold(config, ae_safe_threshold)
 
     demo_video_path = export_first_episode_video(
         repo_id=args.repo_id,

@@ -26,9 +26,17 @@ from PIL import Image
 from torch.utils.data import DataLoader, Subset
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.policies.act.modeling_act import ACTPolicy
+from lerobot.policies.factory import make_pre_post_processors
+
+try:
+    from tools.failure.action_entropy_memory import precompute_action_entropy_in_memory
+except ModuleNotFoundError:
+    from action_entropy_memory import precompute_action_entropy_in_memory
 
 try:
     from tools.failure.offline_utils import (
+        _extract_pretrained_path,
         load_failure_config,
         load_failure_handling_json,
         load_failure_metrics_jsonl,
@@ -36,6 +44,7 @@ try:
     )
 except ModuleNotFoundError:
     from offline_utils import (
+        _extract_pretrained_path,
         load_failure_config,
         load_failure_handling_json,
         load_failure_metrics_jsonl,
@@ -45,6 +54,78 @@ except ModuleNotFoundError:
 DEFAULT_SAFETY_MARGIN = 40
 MAX_VLM_PAIR_SLOTS = 6
 _VLM_EMPTY_IMAGE = np.zeros((16, 16, 3), dtype=np.uint8)
+ACTION_ENTROPY_NPZ_FILENAME = "action_entropy.npz"
+
+
+def _resolve_pretrained_path_from_dataset_root(dataset_root: Path) -> Path | None:
+    record_config_path = dataset_root / "meta" / "record_config.json"
+    if not record_config_path.exists():
+        return None
+
+    try:
+        with record_config_path.open("r", encoding="utf-8") as file:
+            record_config = json.load(file)
+    except Exception:
+        return None
+
+    return _extract_pretrained_path(record_config)
+
+
+def _load_action_entropy_npz(npz_path: Path) -> tuple[dict[int, float], dict[int, float]] | None:
+    if not npz_path.exists():
+        return None
+
+    with np.load(npz_path, allow_pickle=False) as data:
+        if not {"step", "entropy", "max_diff"}.issubset(set(data.files)):
+            return None
+        steps = np.asarray(data["step"], dtype=np.int64)
+        entropies = np.asarray(data["entropy"], dtype=np.float64)
+        max_diffs = np.asarray(data["max_diff"], dtype=np.float64)
+
+    if not (len(steps) == len(entropies) == len(max_diffs)):
+        return None
+
+    entropy_by_step = {int(step): float(entropies[idx]) for idx, step in enumerate(steps)}
+    max_diff_by_step = {int(step): float(max_diffs[idx]) for idx, step in enumerate(steps)}
+    return entropy_by_step, max_diff_by_step
+
+
+def _load_action_entropy_from_failure_metrics(
+    failure_metrics: dict[int, dict],
+) -> tuple[dict[int, float], dict[int, float]]:
+    entropy_by_step: dict[int, float] = {}
+    max_diff_by_step: dict[int, float] = {}
+
+    max_diff_keys = (
+        "action_entropy_max_diff",
+        "action_entropy_sample_max_diff",
+        "action_sample_max_diff",
+    )
+
+    for step, metric_row in failure_metrics.items():
+        entropy_value = metric_row.get("action_entropy")
+        if isinstance(entropy_value, (int, float)):
+            entropy_by_step[int(step)] = float(entropy_value)
+
+        for key in max_diff_keys:
+            max_diff_value = metric_row.get(key)
+            if isinstance(max_diff_value, (int, float)):
+                max_diff_by_step[int(step)] = float(max_diff_value)
+                break
+
+    return entropy_by_step, max_diff_by_step
+
+
+def _save_action_entropy_npz(
+    npz_path: Path,
+    entropy_by_step: dict[int, float],
+    max_diff_by_step: dict[int, float],
+):
+    steps = np.array(sorted(entropy_by_step.keys()), dtype=np.int64)
+    entropy_vals = np.array([entropy_by_step[int(step)] for step in steps], dtype=np.float64)
+    max_diff_vals = np.array([max_diff_by_step.get(int(step), np.nan) for step in steps], dtype=np.float64)
+    npz_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(npz_path, step=steps, entropy=entropy_vals, max_diff=max_diff_vals)
 
 
 def _safe_int(value):
@@ -410,6 +491,20 @@ def visualize_dataset(
     td_cp_threshold = float(td_cp_threshold)
     print(f"Loaded cp_threshold from failure_handling.json: {td_cp_threshold:.6f}")
 
+    # Load action entropy safe threshold (SAFE = entropy > threshold → free space)
+    ae_cfg_json = metrics_cfg.get("action_entropy", {})
+    ae_safe_threshold_raw = ae_cfg_json.get("safe_threshold")
+    if ae_safe_threshold_raw is not None:
+        ae_safe_threshold: float | None = float(ae_safe_threshold_raw)
+        print(f"Loaded action_entropy.safe_threshold from failure_handling.json: {ae_safe_threshold:.6f}")
+        print(f"  SAFE   state: entropy > {ae_safe_threshold:.4f}  (high entropy → free / casual movement)")
+        print(f"  PRECISE state: entropy ≤ {ae_safe_threshold:.4f}  (low entropy → contact / precision)")
+    else:
+        ae_safe_threshold = None
+        print(
+            "[WARN] action_entropy.safe_threshold not in failure_handling.json; SAFE region markers disabled."
+        )
+
     safety_margin = td_config.get("safety_margin", DEFAULT_SAFETY_MARGIN)
 
     td_cfg = failure_cfg.metrics.temporal_disagreement
@@ -476,6 +571,105 @@ def visualize_dataset(
                 vlm_trigger_step_set.add(step)
 
     camera_names = [key.replace("observation.images.", "") for key in dataset.meta.camera_keys]
+    entropy_npz_path = dataset_root / "meta" / ACTION_ENTROPY_NPZ_FILENAME
+    entropy_model_path = _resolve_pretrained_path_from_dataset_root(dataset_root)
+    action_entropy_policy = None
+    action_entropy_preprocessor = None
+    entropy_jsonl_by_step: dict[int, float] = {}
+    entropy_jsonl_max_diff_by_step: dict[int, float] = {}
+    entropy_offline_by_step: dict[int, float] = {}
+    entropy_offline_max_diff_by_step: dict[int, float] = {}
+    stream_indices: list[int] = []
+    for ep_meta in dataset.meta.episodes:
+        from_idx = int(
+            ep_meta["dataset_from_index"]
+            if not isinstance(ep_meta["dataset_from_index"], list)
+            else ep_meta["dataset_from_index"][0]
+        )
+        to_idx = int(
+            ep_meta["dataset_to_index"]
+            if not isinstance(ep_meta["dataset_to_index"], list)
+            else ep_meta["dataset_to_index"][0]
+        )
+        stream_indices.extend(range(from_idx, to_idx, stride))
+
+    entropy_jsonl_by_step, entropy_jsonl_max_diff_by_step = _load_action_entropy_from_failure_metrics(
+        failure_metrics
+    )
+    if entropy_jsonl_by_step:
+        missing_steps = [idx for idx in stream_indices if idx not in entropy_jsonl_by_step]
+        if missing_steps:
+            print(
+                f"[WARN] JSONL action_entropy has {len(entropy_jsonl_by_step)} step(s), "
+                f"missing {len(missing_steps)} streamed step(s)."
+            )
+        else:
+            print("[INFO] Loaded complete action entropy series from failure_metrics.jsonl.")
+    else:
+        print("[WARN] No action_entropy found in failure_metrics.jsonl.")
+
+    loaded = _load_action_entropy_npz(entropy_npz_path)
+    if loaded is not None:
+        entropy_offline_by_step, entropy_offline_max_diff_by_step = loaded
+        missing_steps = [idx for idx in stream_indices if idx not in entropy_offline_by_step]
+        if missing_steps:
+            print(
+                f"[WARN] Cached offline action entropy missing {len(missing_steps)} streamed step(s); "
+                "will recompute."
+            )
+            entropy_offline_by_step = {}
+            entropy_offline_max_diff_by_step = {}
+        else:
+            print(f"[INFO] Loaded cached offline action entropy from: {entropy_npz_path}")
+
+    if not entropy_offline_by_step and entropy_model_path is not None:
+        print(
+            f"[INFO] Offline action entropy cache missing required series. "
+            f"Will precompute and save to: {entropy_npz_path}"
+        )
+        print(f"[INFO] Loading ACT policy for offline action entropy from: {entropy_model_path}")
+        action_entropy_policy = ACTPolicy.from_pretrained(str(entropy_model_path))
+        action_entropy_policy.eval()
+        action_entropy_preprocessor, _ = make_pre_post_processors(
+            action_entropy_policy.config,
+            pretrained_path=str(entropy_model_path),
+        )
+        print(
+            f"[INFO] Offline action entropy enabled: num_samples=1, "
+            f"chunk_size={action_entropy_policy.config.chunk_size}"
+        )
+        print(
+            f"[INFO] Precomputing offline action entropy for {len(stream_indices)} streamed steps "
+            "with num_samples=1..."
+        )
+        entropy_offline_by_step, entropy_offline_max_diff_by_step = precompute_action_entropy_in_memory(
+            dataset=dataset,
+            policy=action_entropy_policy,
+            preprocessor=action_entropy_preprocessor,
+            indices=stream_indices,
+            batch_size=4,
+        )
+        _save_action_entropy_npz(
+            entropy_npz_path,
+            entropy_by_step=entropy_offline_by_step,
+            max_diff_by_step=entropy_offline_max_diff_by_step,
+        )
+        print(f"[INFO] Saved offline action entropy cache to: {entropy_npz_path}")
+
+    action_entropy_enabled = bool(entropy_jsonl_by_step or entropy_offline_by_step)
+
+    if action_entropy_enabled:
+        if entropy_offline_max_diff_by_step and max(entropy_offline_max_diff_by_step.values()) < 1e-8:
+            print(
+                "[WARN] Offline action entropy sampling seems deterministic for num_samples=1 "
+                "(all max diff < 1e-8)."
+            )
+        print("[INFO] Action entropy comparison data ready (JSONL + offline).")
+    elif entropy_model_path is None:
+        print(
+            "[WARN] Could not resolve pretrained_path and JSONL has no action_entropy; "
+            "action entropy visualization is disabled."
+        )
 
     if failure_metrics:
         camera_views = [rrb.Spatial2DView(origin=f"cameras/{cam}") for cam in camera_names]
@@ -538,12 +732,43 @@ def visualize_dataset(
                         rrb.TimeSeriesView(name="Endpoint Shift", origin="metrics/endpoint_shift"),
                         rrb.TimeSeriesView(name="Action Jerk", origin="metrics/action_jerk"),
                         rrb.TimeSeriesView(name="Checkpoint Flag", origin="metrics/checkpoint_flag"),
+                        rrb.TimeSeriesView(
+                            name="Action Entropy (JSONL vs Offline)",
+                            origin="metrics/action_entropy_compare",
+                        ),
+                        rrb.TimeSeriesView(
+                            name="Action Sample Diversity (JSONL vs Offline)",
+                            origin="metrics/action_entropy_max_diff_compare",
+                        ),
                     ),
                     middle_right_panel,
                     column_shares=[1, 1],
                 ),
                 rrb.Vertical(*camera_views, id_overlay_view, row_shares=[6] * len(camera_views) + [1]),
                 column_shares=[4, 1],
+            ),
+            collapse_panels=True,
+        )
+    elif action_entropy_enabled:
+        camera_views = [rrb.Spatial2DView(origin=f"cameras/{cam}") for cam in camera_names]
+        id_overlay_view = rrb.TextDocumentView(
+            name="Episode ID",
+            origin="overlay/episode_id",
+        )
+        blueprint = rrb.Blueprint(
+            rrb.Horizontal(
+                rrb.Vertical(
+                    rrb.TimeSeriesView(
+                        name="Action Entropy (JSONL vs Offline)",
+                        origin="metrics/action_entropy_compare",
+                    ),
+                    rrb.TimeSeriesView(
+                        name="Action Sample Diversity (JSONL vs Offline)",
+                        origin="metrics/action_entropy_max_diff_compare",
+                    ),
+                ),
+                rrb.Vertical(*camera_views, id_overlay_view, row_shares=[6] * len(camera_views) + [1]),
+                column_shares=[1, 2],
             ),
             collapse_panels=True,
         )
@@ -565,6 +790,20 @@ def visualize_dataset(
                 rr.SeriesPoints(colors=[255, 0, 0], markers="diamond", marker_sizes=5.0),
                 static=True,
             )
+
+    if ae_safe_threshold is not None:
+        # Red dots for SAFE region (entropy > threshold → robot in free/casual space)
+        # Same style as failed_markers on temporal_disagreement_smoothed
+        rr.log(
+            "metrics/action_entropy_compare/jsonl/safe_region",
+            rr.SeriesPoints(colors=[255, 0, 0], markers="diamond", marker_sizes=5.0),
+            static=True,
+        )
+        rr.log(
+            "metrics/action_entropy_compare/offline/safe_region",
+            rr.SeriesPoints(colors=[255, 0, 0], markers="diamond", marker_sizes=5.0),
+            static=True,
+        )
 
     global_step = 0
     prev_attention_entropy = None
@@ -642,6 +881,41 @@ def visualize_dataset(
             old_keys = [k for k in list(image_cache.keys()) if k < i - 150]
             for k in old_keys:
                 del image_cache[k]
+
+            if action_entropy_enabled:
+                entropy_value_jsonl = entropy_jsonl_by_step.get(i)
+                sample_max_diff_jsonl = entropy_jsonl_max_diff_by_step.get(i)
+                entropy_value_offline = entropy_offline_by_step.get(i)
+                sample_max_diff_offline = entropy_offline_max_diff_by_step.get(i)
+
+                if ae_safe_threshold is not None:
+                    # Plot a horizontal threshold line in the same chart as JSONL/offline entropy.
+                    rr.log("metrics/action_entropy_compare/threshold", rr.Scalars(ae_safe_threshold))
+
+                if entropy_value_jsonl is not None:
+                    rr.log("metrics/action_entropy_compare/jsonl", rr.Scalars(entropy_value_jsonl))
+                    if ae_safe_threshold is not None and entropy_value_jsonl > ae_safe_threshold:
+                        rr.log(
+                            "metrics/action_entropy_compare/jsonl/safe_region",
+                            rr.Scalars(entropy_value_jsonl),
+                        )
+                if entropy_value_offline is not None:
+                    rr.log("metrics/action_entropy_compare/offline", rr.Scalars(entropy_value_offline))
+                    if ae_safe_threshold is not None and entropy_value_offline > ae_safe_threshold:
+                        rr.log(
+                            "metrics/action_entropy_compare/offline/safe_region",
+                            rr.Scalars(entropy_value_offline),
+                        )
+                if sample_max_diff_jsonl is not None:
+                    rr.log(
+                        "metrics/action_entropy_max_diff_compare/jsonl",
+                        rr.Scalars(sample_max_diff_jsonl),
+                    )
+                if sample_max_diff_offline is not None:
+                    rr.log(
+                        "metrics/action_entropy_max_diff_compare/offline",
+                        rr.Scalars(sample_max_diff_offline),
+                    )
 
             if failure_metrics:
                 m = failure_metrics.get(i, {})
