@@ -300,8 +300,8 @@ def compute_action_entropy_safe_threshold(
     pipeline: Literal["aloha", "robobase"] = "aloha",
     plot: bool = False,
     plot_dir: str | None = None,
-) -> tuple[float, int, int]:
-    """Compute safety threshold from precision-region entropy samples.
+) -> tuple[float, float, int, int]:
+    """Compute safety threshold and drop threshold from entropy samples.
 
     `pipeline="aloha"` reproduces `aloha/act/imitate_episodes.py`.
     `pipeline="robobase"` reproduces `robobase/robobase/utils.py`.
@@ -311,6 +311,7 @@ def compute_action_entropy_safe_threshold(
         plot_dir = os.path.join(os.getcwd(), "plot")
 
     all_precision_entropies = []
+    all_non_precision_entropies = []
     total_frames = 0
     episode_index = 0
 
@@ -324,35 +325,37 @@ def compute_action_entropy_safe_threshold(
 
         if pipeline == "aloha":
             labels = cluster_entropy_hdbscan_aloha(
-                episode_entropy,
-                plot=plot,
-                plot_dir=plot_dir,
-                rollout_id=episode_index,
+                episode_entropy, plot=plot, plot_dir=plot_dir, rollout_id=episode_index
             )
         elif pipeline == "robobase":
             labels = cluster_entropy_hdbscan_robobase(
-                episode_entropy,
-                plot=plot,
-                plot_dir=plot_dir,
-                rollout_id=episode_index,
+                episode_entropy, plot=plot, plot_dir=plot_dir, rollout_id=episode_index
             )
         else:
             raise ValueError(f"Unsupported pipeline: {pipeline}")
 
         precision_mask = labels == 0
         all_precision_entropies.extend(episode_entropy[precision_mask])
+        all_non_precision_entropies.extend(episode_entropy[~precision_mask])
         episode_index += 1
 
     all_precision_entropies = np.array(all_precision_entropies)
+    all_non_precision_entropies = np.array(all_non_precision_entropies)
 
     if all_precision_entropies.size == 0:
         valid_non_empty = [
             np.asarray(ep, dtype=float).reshape(-1) for ep in episodes_entropies if len(ep) > 0
         ]
         if not valid_non_empty:
-            return 0.0, 0, 0
+            return 0.0, 0.0, 0, 0
         all_entropies_flat = np.concatenate(valid_non_empty)
-        return float(np.percentile(all_entropies_flat, 50)), 0, total_frames
-
+        return float(np.percentile(all_entropies_flat, 50)), 0.15, 0, total_frames
     safe_threshold = float(np.percentile(all_precision_entropies, percentile))
-    return safe_threshold, int(all_precision_entropies.size), total_frames
+    if all_non_precision_entropies.size > 0:
+        median_free_entropy = float(np.median(all_non_precision_entropies))
+        typical_prominence = median_free_entropy - safe_threshold
+        drop_threshold = max(0.08, typical_prominence * 0.5)
+    else:
+        drop_threshold = 0.15
+
+    return safe_threshold, drop_threshold, int(all_precision_entropies.size), total_frames

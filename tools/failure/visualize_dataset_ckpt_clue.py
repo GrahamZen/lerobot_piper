@@ -266,10 +266,11 @@ def _precompute_entropy_peak_cp_by_threshold(
     threshold: float,
     min_interval_len: int = 15,
     smooth_window: int = 5,
+    drop_threshold: float = 0.15,
 ) -> dict[int, int | None]:
     """
-    通过硬阈值 (Threshold) 寻找 Safe Region，并提取该区域的 Peak Checkpoint。
-    完全模拟真机在线状态机的判断逻辑。
+    通过硬阈值 (Threshold) 和回落阈值 (Drop Threshold) 寻找 Safe Region，
+    并提取该区域的 Peak Checkpoint。完全模拟真机在线状态机的判断逻辑。
     """
     if not entropy_by_step:
         return {}
@@ -291,21 +292,30 @@ def _precompute_entropy_peak_cp_by_threshold(
         else:
             smoothed_entropy[step] = float("nan")
 
-    # Pass 2: 基于平滑后的阈值划分 Safe Region 并寻找 Peak
+    # Pass 2: 基于平滑后的阈值和回落幅度划分 Safe Region 并寻找 Peak
     completed_intervals: list[tuple[int, int, int]] = []  # (start, end, peak_step)
     in_free_run: list[int] = []
+    current_max_val = -float("inf")
 
     for step in sorted_steps:
         val = smoothed_entropy[step]
         if not math.isnan(val) and val > threshold:
             in_free_run.append(step)
+            if val > current_max_val:
+                current_max_val = val
+            elif current_max_val - val >= drop_threshold:
+                if len(in_free_run) >= min_interval_len:
+                    peak_step = max(in_free_run, key=lambda s: entropy_by_step[s])
+                    completed_intervals.append((in_free_run[0], in_free_run[-1], peak_step))
+                in_free_run = [step]
+                current_max_val = val
         else:
             if in_free_run:
                 if len(in_free_run) >= min_interval_len:
-                    # 找 Peak 时仍使用原始 Raw Entropy 取最真实极值点。
                     peak_step = max(in_free_run, key=lambda s: entropy_by_step[s])
                     completed_intervals.append((in_free_run[0], in_free_run[-1], peak_step))
                 in_free_run = []
+            current_max_val = -float("inf")
     # 故意不添加末尾未闭合区间，因为它还没结束。
 
     # Pass 3: 为每个 Step 映射最新已闭合区间的 Peak 作为 Checkpoint
@@ -803,6 +813,7 @@ def visualize_dataset(
     # Load action entropy safe threshold (SAFE = entropy > threshold → free space)
     ae_cfg_json = metrics_cfg.get("action_entropy", {})
     ae_safe_threshold_raw = ae_cfg_json.get("safe_threshold")
+    ae_drop_threshold_raw = ae_cfg_json.get("drop_threshold")
     if ae_safe_threshold_raw is not None:
         ae_safe_threshold: float | None = float(ae_safe_threshold_raw)
         print(f"Loaded action_entropy.safe_threshold from failure_handling.json: {ae_safe_threshold:.6f}")
@@ -813,6 +824,12 @@ def visualize_dataset(
         print(
             "[WARN] action_entropy.safe_threshold not in failure_handling.json; SAFE region markers disabled."
         )
+    if ae_drop_threshold_raw is not None:
+        ae_drop_threshold: float | None = float(ae_drop_threshold_raw)
+        print(f"Loaded action_entropy.drop_threshold from failure_handling.json: {ae_drop_threshold:.6f}")
+    else:
+        ae_drop_threshold = 0.15
+        print("[WARN] action_entropy.drop_threshold not in failure_handling.json; using default 0.15.")
 
     safety_margin = td_config.get("safety_margin", DEFAULT_SAFETY_MARGIN)
 
@@ -998,13 +1015,13 @@ def visualize_dataset(
     entropy_peak_steps_offline: set[int] = set()
 
     if action_entropy_enabled and ae_safe_threshold is not None:
-        # 处理 JSONL 来源的 Entropy
         if entropy_jsonl_by_step:
             entropy_peak_cp_jsonl_by_step = _precompute_entropy_peak_cp_by_threshold(
                 entropy_by_step=entropy_jsonl_by_step,
                 threshold=ae_safe_threshold,
                 min_interval_len=15,
                 smooth_window=5,
+                drop_threshold=ae_drop_threshold,
             )
             entropy_peak_steps_jsonl = {
                 int(v) for v in entropy_peak_cp_jsonl_by_step.values() if v is not None
@@ -1014,14 +1031,13 @@ def visualize_dataset(
                 "[INFO] (Threshold Mode) Pre-computed JSONL peak checkpoints: "
                 f"found {n_peaks_jsonl} valid safe regions."
             )
-
-        # 处理 Offline 来源的 Entropy
         if entropy_offline_by_step:
             entropy_peak_cp_offline_by_step = _precompute_entropy_peak_cp_by_threshold(
                 entropy_by_step=entropy_offline_by_step,
                 threshold=ae_safe_threshold,
                 min_interval_len=15,
                 smooth_window=5,
+                drop_threshold=ae_drop_threshold,
             )
             entropy_peak_steps_offline = {
                 int(v) for v in entropy_peak_cp_offline_by_step.values() if v is not None

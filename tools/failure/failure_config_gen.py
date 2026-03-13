@@ -373,6 +373,12 @@ def _set_action_entropy_safe_threshold(config: dict, safe_threshold: float) -> N
     ae_cfg["safe_threshold"] = float(safe_threshold)
 
 
+def _set_action_entropy_drop_threshold(config: dict, drop_threshold: float) -> None:
+    metrics = config.setdefault("metrics", {})
+    ae_cfg = metrics.setdefault("action_entropy", {})
+    ae_cfg["drop_threshold"] = float(drop_threshold)
+
+
 def _save_failure_handling_config(failure_handling_path: Path, config: dict) -> None:
     failure_handling_path.parent.mkdir(parents=True, exist_ok=True)
     with failure_handling_path.open("w", encoding="utf-8") as file:
@@ -569,10 +575,11 @@ def main() -> None:
     )
 
     ae_safe_threshold: float | None = None
+    ae_drop_threshold: float | None = None
     p_count: int | None = None
     ae_total: int | None = None
     if action_entropies is not None:
-        ae_safe_threshold, p_count, ae_total = compute_action_entropy_safe_threshold(
+        ae_safe_threshold, ae_drop_threshold, p_count, ae_total = compute_action_entropy_safe_threshold(
             action_entropies,
             percentile=args.entropy_percentile,
         )
@@ -588,6 +595,7 @@ def main() -> None:
     if (
         action_entropy_source is not None
         and ae_safe_threshold is not None
+        and ae_drop_threshold is not None
         and ae_total is not None
         and p_count is not None
     ):
@@ -595,6 +603,7 @@ def main() -> None:
         print(f"action_entropy_samples: {ae_total}")
         print(f"action_entropy_precision_set_samples: {p_count}")
         print(f"action_entropy_safe_threshold_p{args.entropy_percentile}: {ae_safe_threshold}")
+        print(f"action_entropy_drop_threshold: {ae_drop_threshold}")
     else:
         print("action_entropy_source: unavailable")
         print("action_entropy_safe_threshold: skipped")
@@ -610,7 +619,9 @@ def main() -> None:
     _set_cp_threshold(config, cp_threshold)
     if ae_safe_threshold is not None:
         _set_action_entropy_safe_threshold(config, ae_safe_threshold)
-    else:
+    if ae_drop_threshold is not None:
+        _set_action_entropy_drop_threshold(config, ae_drop_threshold)
+    if ae_safe_threshold is None:
         print(
             "[WARN] Keep existing metrics.action_entropy.safe_threshold in failure_handling.json "
             "(or default value if newly created config)."
