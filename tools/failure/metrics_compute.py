@@ -1,11 +1,13 @@
-"""Pure computation helpers for failure detection metrics.
+"""Computation helpers for failure detection metrics.
 
-These functions have no I/O dependencies and can be reused independently.
+Plotting is optional and only enabled when explicitly requested.
 """
 
 from __future__ import annotations
 
 import importlib
+import os
+from typing import Literal
 
 import numpy as np
 
@@ -21,177 +23,336 @@ def compute_cp_threshold(calibration_scores: np.ndarray, alpha: float) -> tuple[
     return cp_threshold, q_level, n
 
 
-def compute_action_entropy_safe_threshold(
-    episodes_entropies: list[np.ndarray],
-    percentile: float = 95.0,
-    min_cluster_size: int = 50,
-    min_samples: int = 10,
-    contamination: float = 0.05,
-    plot: bool = False,
-) -> tuple[float, int, int]:
+def _resolve_hdbscan_class():
+    try:
+        hdbscan_module = importlib.import_module("hdbscan")
+        return hdbscan_module.HDBSCAN
+    except Exception:  # nosec B110
+        pass
+
     try:
         sklearn_cluster = importlib.import_module("sklearn.cluster")
-        sklearn_preprocessing = importlib.import_module("sklearn.preprocessing")
-        sklearn_ensemble = importlib.import_module("sklearn.ensemble")
+        return sklearn_cluster.HDBSCAN
     except Exception as exc:
         raise ImportError(
-            "scikit-learn is required. Please install scikit-learn in the current environment."
+            "HDBSCAN is required. Install `hdbscan` (preferred), or use a sklearn build with HDBSCAN."
         ) from exc
 
-    hdbscan = sklearn_cluster.HDBSCAN
-    standard_scaler = sklearn_preprocessing.StandardScaler
-    isolation_forest = sklearn_ensemble.IsolationForest
 
-    if not isinstance(episodes_entropies, list) or len(episodes_entropies) == 0:
-        raise ValueError("episodes_entropies must be a non-empty list of 1D arrays")
+def _resolve_isolation_forest_class():
+    try:
+        sklearn_ensemble = importlib.import_module("sklearn.ensemble")
+        return sklearn_ensemble.IsolationForest
+    except Exception as exc:
+        raise ImportError("scikit-learn is required for RoboBase-style outlier filtering.") from exc
+
+
+def _resolve_matplotlib_pyplot():
+    try:
+        matplotlib_pyplot = importlib.import_module("matplotlib.pyplot")
+        return matplotlib_pyplot
+    except Exception as exc:
+        raise ImportError("matplotlib is required for plotting entropy clustering figures.") from exc
+
+
+def _safe_zscore(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=float)
+    if x.size == 0:
+        return x
+    std = float(np.std(x))
+    if std <= 1e-12:
+        return np.zeros_like(x, dtype=float)
+    return (x - float(np.mean(x))) / std
+
+
+def _plot_entropy_and_clusters(
+    entropy_for_curve: np.ndarray,
+    features: np.ndarray,
+    initial_labels: np.ndarray,
+    refined_labels: np.ndarray,
+    output_dir: str,
+    rollout_id: int,
+    entropy_curve_name: str,
+    figsize: tuple[int, int] = (8, 6),
+) -> None:
+    plt = _resolve_matplotlib_pyplot()
+    os.makedirs(output_dir, exist_ok=True)
+
+    plt.figure(figsize=(10, 6) if figsize == (8, 6) else figsize)
+    plt.plot(np.arange(len(entropy_for_curve)), entropy_for_curve, marker="o", markersize=5)
+    plt.title("1D Data Plot")
+    plt.xlabel("Timestep")
+    plt.ylabel("Entropy")
+    plt.grid(True)
+    plt.savefig(os.path.join(output_dir, entropy_curve_name))
+    plt.close()
+
+    plt.figure(figsize=figsize)
+    plt.scatter(features[:, 0], features[:, 1], c=initial_labels, cmap="viridis", marker="o")
+    plt.title("HDBSCAN Initial Clustering")
+    plt.xlabel("Feature 1")
+    plt.ylabel("Feature 2")
+    plt.colorbar(label="Cluster Label")
+    plt.savefig(os.path.join(output_dir, f"rollout{rollout_id}-hdbscan-raw.png"))
+    plt.close()
+
+    plt.figure(figsize=figsize)
+    scatter = plt.scatter(
+        features[:, 0],
+        features[:, 1],
+        c=refined_labels,
+        cmap="viridis",
+        marker="o",
+    )
+    cbar = plt.colorbar(scatter)
+    cbar.set_label("Refined Cluster Label", rotation=270, labelpad=15)
+    plt.title("HDBSCAN + Custom Merge Clustering")
+    plt.xlabel("Feature 1")
+    plt.ylabel("Feature 2")
+    plt.grid(True)
+    plt.savefig(os.path.join(output_dir, f"rollout{rollout_id}-hdbscan-refine.png"))
+    plt.close()
+
+
+def _remove_outliers_isolation_forest_like_robobase(
+    data: np.ndarray,
+    contamination: float = 0.1,
+) -> np.ndarray:
+    isolation_forest = _resolve_isolation_forest_class()
+    model = isolation_forest(contamination=contamination)
+    predictions = model.fit_predict(data.reshape(-1, 1))
+    repaired = data.copy()
+
+    if repaired.size == 0:
+        return repaired
+
+    if predictions[0] == -1:
+        next_idx = 1
+        while next_idx < len(repaired) and predictions[next_idx] == -1:
+            next_idx += 1
+        if next_idx < len(repaired):
+            repaired[0] = repaired[next_idx]
+
+    if predictions[-1] == -1:
+        prev_idx = len(repaired) - 2
+        while prev_idx >= 0 and predictions[prev_idx] == -1:
+            prev_idx -= 1
+        if prev_idx >= 0:
+            repaired[-1] = repaired[prev_idx]
+
+    for i in range(1, len(repaired) - 1):
+        if predictions[i] == -1:
+            prev_idx = i - 1
+            while prev_idx >= 0 and predictions[prev_idx] == -1:
+                prev_idx -= 1
+
+            next_idx = i + 1
+            while next_idx < len(repaired) and predictions[next_idx] == -1:
+                next_idx += 1
+
+            if prev_idx >= 0 and next_idx < len(repaired):
+                repaired[i] = (repaired[prev_idx] + repaired[next_idx]) / 2.0
+            elif prev_idx >= 0:
+                repaired[i] = repaired[prev_idx]
+            elif next_idx < len(repaired):
+                repaired[i] = repaired[next_idx]
+    return repaired
+
+
+def cluster_entropy_hdbscan_aloha(
+    entropy: np.ndarray,
+    min_cluster_size: int = 5,
+    warmup_noise_frames: int = 50,
+    plot: bool = False,
+    plot_dir: str | None = None,
+    rollout_id: int | None = None,
+) -> np.ndarray:
+    """Reproduce ALOHA `imitate_episodes.py` HDBSCAN labeling.
+
+    Returns binary labels where:
+    - 0: precision region
+    - 1: non-precision/noise region
+    """
+
+    hdbscan_cls = _resolve_hdbscan_class()
+    entropy = np.asarray(entropy, dtype=float).reshape(-1)
+    n = len(entropy)
+    if n == 0:
+        return np.zeros((0,), dtype=np.int64)
+
+    entropy_norm = _safe_zscore(entropy)
+    indices = _safe_zscore(np.arange(n, dtype=float))
+    features = np.stack((indices, entropy_norm), axis=-1)
+
+    clusterer = hdbscan_cls(min_cluster_size=min_cluster_size)
+    initial_labels = np.asarray(clusterer.fit_predict(features), dtype=int)
+
+    if n > warmup_noise_frames:
+        initial_labels[:warmup_noise_frames] = -1
+    else:
+        initial_labels[:] = -1
+
+    refined_labels = np.full_like(initial_labels, -1)
+    unique_labels = np.unique(initial_labels[initial_labels >= 0])
+    for label in unique_labels:
+        cluster_points = features[initial_labels == label]
+        if np.mean(cluster_points[:, 1]) < 0:
+            refined_labels[initial_labels == label] = 0
+        else:
+            refined_labels[initial_labels == label] = -1
+
+    if plot and plot_dir is not None and rollout_id is not None:
+        _plot_entropy_and_clusters(
+            entropy_for_curve=entropy,
+            features=features,
+            initial_labels=initial_labels,
+            refined_labels=refined_labels,
+            output_dir=plot_dir,
+            rollout_id=rollout_id,
+            entropy_curve_name=f"rollout{rollout_id}_entropy.png",
+            figsize=(8, 6),
+        )
+
+    return np.abs(refined_labels).astype(np.int64)
+
+
+def _split_large_clusters_like_robobase(
+    labels: np.ndarray,
+    max_size: int = 25,
+) -> np.ndarray:
+    labels = np.asarray(labels, dtype=int).copy()
+    if labels.size == 0:
+        return labels
+
+    max_label = int(np.max(labels)) if np.any(labels >= 0) else -1
+    new_label = max_label + 1
+
+    for label in np.unique(labels):
+        if label == -1:
+            continue
+        cluster_indices = np.where(labels == label)[0]
+        if len(cluster_indices) > max_size:
+            num_splits = len(cluster_indices) // max_size + int(len(cluster_indices) % max_size > 0)
+            for i in range(num_splits):
+                split_indices = cluster_indices[i * max_size : (i + 1) * max_size]
+                labels[split_indices] = new_label
+                new_label += 1
+    return labels
+
+
+def cluster_entropy_hdbscan_robobase(
+    entropy: np.ndarray,
+    min_cluster_size: int = 5,
+    contamination: float = 0.1,
+    max_cluster_size: int = 25,
+    plot: bool = False,
+    plot_dir: str | None = None,
+    rollout_id: int | None = None,
+) -> np.ndarray:
+    """Reproduce RoboBase `utils.hdbscan_with_custom_merge` labeling."""
+
+    hdbscan_cls = _resolve_hdbscan_class()
+    entropy = np.asarray(entropy, dtype=float).reshape(-1)
+    n = len(entropy)
+    if n == 0:
+        return np.zeros((0,), dtype=np.int64)
+
+    entropy_norm = _safe_zscore(entropy)
+    entropy_norm = _remove_outliers_isolation_forest_like_robobase(
+        entropy_norm,
+        contamination=contamination,
+    )
+    entropy_norm = _safe_zscore(entropy_norm)
+    indices = _safe_zscore(np.arange(n, dtype=float))
+    features = np.stack((indices, entropy_norm), axis=-1)
+
+    clusterer = hdbscan_cls(min_cluster_size=min_cluster_size)
+    initial_labels = np.asarray(clusterer.fit_predict(features), dtype=int)
+    initial_labels = _split_large_clusters_like_robobase(initial_labels, max_size=max_cluster_size)
+
+    refined_labels = np.full_like(initial_labels, -1)
+    unique_labels = np.unique(initial_labels[initial_labels >= 0])
+    for label in unique_labels:
+        cluster_points = features[initial_labels == label]
+        if np.mean(cluster_points[:, 1] < 1):
+            refined_labels[initial_labels == label] = 0
+        else:
+            refined_labels[initial_labels == label] = -1
+
+    if plot and plot_dir is not None and rollout_id is not None:
+        _plot_entropy_and_clusters(
+            entropy_for_curve=entropy_norm,
+            features=features,
+            initial_labels=initial_labels,
+            refined_labels=refined_labels,
+            output_dir=plot_dir,
+            rollout_id=rollout_id,
+            entropy_curve_name=f"rollout{rollout_id}-entropy-curve.png",
+            figsize=(10, 6),
+        )
+
+    return np.abs(refined_labels).astype(np.int64)
+
+
+def compute_action_entropy_safe_threshold(
+    episodes_entropies: list[np.ndarray],
+    percentile: float = 99.0,
+    pipeline: Literal["aloha", "robobase"] = "aloha",
+    plot: bool = False,
+    plot_dir: str | None = None,
+) -> tuple[float, int, int]:
+    """Compute safety threshold from precision-region entropy samples.
+
+    `pipeline="aloha"` reproduces `aloha/act/imitate_episodes.py`.
+    `pipeline="robobase"` reproduces `robobase/robobase/utils.py`.
+    """
+
+    if plot and plot_dir is None:
+        plot_dir = os.path.join(os.getcwd(), "plot")
 
     all_precision_entropies = []
     total_frames = 0
-
-    # Used to collect plotting data: stores (entropy_array, p_mask_array) for each episode
-    plot_data = []
+    episode_index = 0
 
     for episode_entropy_raw in episodes_entropies:
-        if episode_entropy_raw.ndim != 1:
-            raise ValueError("Each episode entropy must be a 1D array")
-
-        t = len(episode_entropy_raw)
-        if t == 0:
+        episode_entropy = np.asarray(episode_entropy_raw, dtype=float).reshape(-1)
+        num_frames = len(episode_entropy)
+        if num_frames == 0:
+            episode_index += 1
             continue
+        total_frames += num_frames
 
-        total_frames += t
+        if pipeline == "aloha":
+            labels = cluster_entropy_hdbscan_aloha(
+                episode_entropy,
+                plot=plot,
+                plot_dir=plot_dir,
+                rollout_id=episode_index,
+            )
+        elif pipeline == "robobase":
+            labels = cluster_entropy_hdbscan_robobase(
+                episode_entropy,
+                plot=plot,
+                plot_dir=plot_dir,
+                rollout_id=episode_index,
+            )
+        else:
+            raise ValueError(f"Unsupported pipeline: {pipeline}")
 
-        # Copy to avoid modifying the original data
-        episode_entropy = episode_entropy_raw.copy()
-
-        # ==========================================
-        # 0. Paper step 1: Isolation Forest outlier filtering with nearest-neighbor replacement
-        # ==========================================
-        iso_forest = isolation_forest(contamination=contamination, random_state=42)
-        outlier_labels = iso_forest.fit_predict(episode_entropy.reshape(-1, 1))
-
-        normal_indices = np.where(outlier_labels == 1)[0]
-        outlier_indices = np.where(outlier_labels == -1)[0]
-
-        if len(normal_indices) > 0 and len(outlier_indices) > 0:
-            for idx in outlier_indices:
-                nearest_normal_idx = normal_indices[np.argmin(np.abs(normal_indices - idx))]
-                episode_entropy[idx] = episode_entropy[nearest_normal_idx]
-
-        # ==========================================
-        # 1. Paper step 2: Concatenate the time index t
-        # ==========================================
-        t_indices = np.arange(t).reshape(-1, 1)
-        h_values = episode_entropy.reshape(-1, 1)
-        features = np.hstack([t_indices, h_values])
-
-        # ==========================================
-        # 2. Paper step 3: Episode-level normalization
-        # ==========================================
-        scaler = standard_scaler()
-        features_normalized = scaler.fit_transform(features)
-
-        # ==========================================
-        # 3. Paper step 4: Run HDBSCAN clustering
-        # ==========================================
-        clusterer = hdbscan(min_cluster_size=min_cluster_size, min_samples=min_samples)
-        labels = clusterer.fit_predict(features_normalized)
-
-        # ==========================================
-        # 4. Paper step 5: Filter and extract the high-precision region (P set)
-        # ==========================================
-        valid_p_indices = []
-        unique_labels = set(labels)
-
-        for label in unique_labels:
-            if label == -1:
-                continue  # Label -1 is noise and belongs to the Casualness set
-
-            cluster_mask = labels == label
-            mean_norm_entropy = features_normalized[cluster_mask, 1].mean()
-
-            if mean_norm_entropy < 0:
-                valid_p_indices.extend(np.where(cluster_mask)[0])
-
-        all_precision_entropies.extend(episode_entropy[valid_p_indices])
-
-        # [Added] Collect visualization data
-        if plot:
-            p_mask = np.zeros(t, dtype=bool)
-            p_mask[valid_p_indices] = True
-            plot_data.append((episode_entropy, p_mask))
+        precision_mask = labels == 0
+        all_precision_entropies.extend(episode_entropy[precision_mask])
+        episode_index += 1
 
     all_precision_entropies = np.array(all_precision_entropies)
 
-    # Fallback mechanism
     if all_precision_entropies.size == 0:
-        all_entropies_flat = np.concatenate(episodes_entropies)
-        safe_threshold = float(np.percentile(all_entropies_flat, 50))
-        p_size = 0
-    else:
-        # ==========================================
-        # 5. Extract the hard threshold for real-world deployment
-        # ==========================================
-        safe_threshold = float(np.percentile(all_precision_entropies, percentile))
-        p_size = int(all_precision_entropies.size)
+        valid_non_empty = [
+            np.asarray(ep, dtype=float).reshape(-1) for ep in episodes_entropies if len(ep) > 0
+        ]
+        if not valid_non_empty:
+            return 0.0, 0, 0
+        all_entropies_flat = np.concatenate(valid_non_empty)
+        return float(np.percentile(all_entropies_flat, 50)), 0, total_frames
 
-    # ==========================================
-    # 6. [Added] Plotting logic
-    # ==========================================
-    if plot and plot_data:
-        try:
-            import matplotlib.pyplot as plt
-        except ImportError:
-            print("Warning: 'matplotlib' is required for plotting. Skipping visualization.")
-        else:
-            plt.figure(figsize=(14, 6))
-            current_t = 0
-
-            for i, (ep_entropy, p_mask) in enumerate(plot_data):
-                t_ep = len(ep_entropy)
-                t_arr = np.arange(current_t, current_t + t_ep)
-
-                # Plot the P set (blue points)
-                plt.scatter(
-                    t_arr[p_mask],
-                    ep_entropy[p_mask],
-                    c="#1f77b4",
-                    s=12,
-                    alpha=0.8,
-                    label="P Set (Precision)" if i == 0 else "",
-                )
-
-                # Plot the C set (orange points)
-                plt.scatter(
-                    t_arr[~p_mask],
-                    ep_entropy[~p_mask],
-                    c="#ff7f0e",
-                    s=12,
-                    alpha=0.4,
-                    label="C Set (Casualness)" if i == 0 else "",
-                )
-
-                # Draw separators between episodes
-                if i > 0:
-                    plt.axvline(x=current_t, color="gray", linestyle=":", alpha=0.5)
-
-                current_t += t_ep
-
-            # Draw the computed safe-threshold line
-            plt.axhline(
-                y=safe_threshold,
-                color="green",
-                linestyle="--",
-                linewidth=2,
-                label=f"Safe Threshold ({percentile}th percentile): {safe_threshold:.4f}",
-            )
-
-            plt.title("Action Entropy Clustering: P Set vs C Set Across Episodes")
-            plt.xlabel("Global Time Steps")
-            plt.ylabel("Action Entropy")
-            plt.legend(loc="upper right")
-            plt.grid(True, alpha=0.3)
-            plt.tight_layout()
-            plt.show()
-
-    return safe_threshold, p_size, total_frames
+    safe_threshold = float(np.percentile(all_precision_entropies, percentile))
+    return safe_threshold, int(all_precision_entropies.size), total_frames

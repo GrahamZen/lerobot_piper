@@ -16,6 +16,7 @@ Usage:
 import argparse
 import io
 import json
+import math
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -209,6 +210,174 @@ def _save_action_entropy_npz(
     max_diff_vals = np.array([max_diff_by_step.get(int(step), np.nan) for step in steps], dtype=np.float64)
     npz_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez(npz_path, step=steps, entropy=entropy_vals, max_diff=max_diff_vals)
+
+
+def _precompute_entropy_peak_cp_by_step(
+    entropy_by_step: dict[int, float],
+    entropy_labels_by_step: dict[int, int],
+    min_interval_len: int = 25,
+) -> dict[int, int | None]:
+    """For each step, return the Peak Entropy Point (step with the highest entropy)
+    from the most recently *completed* free interval (label >= 1)
+    that ended strictly before the current step.
+
+    A free interval is a maximal run of consecutive steps whose entropy label is
+    in the free/red region (label >= 1). An interval that is still open at the
+    last observed step is
+    intentionally excluded – it has not yet "ended" so it cannot be the
+    *previous* interval.
+    """
+    if not entropy_by_step or not entropy_labels_by_step:
+        return {}
+
+    sorted_steps = sorted(entropy_by_step.keys())
+
+    # ── Pass 1: identify completed free intervals ─────────────────────────────
+    completed_intervals: list[tuple[int, int, int]] = []  # (start, end, peak_step)
+    in_free_run: list[int] = []
+
+    for step in sorted_steps:
+        if entropy_labels_by_step.get(step, -1) >= 1:
+            in_free_run.append(step)
+        else:
+            if in_free_run:
+                if len(in_free_run) >= min_interval_len:
+                    peak_step = max(in_free_run, key=lambda s: entropy_by_step[s])
+                    completed_intervals.append((in_free_run[0], in_free_run[-1], peak_step))
+                in_free_run = []
+    # Intentionally do NOT add an open run at the end – it is not yet "previous".
+
+    # ── Pass 2: for every step, find the latest completed interval ending before it
+    peak_cp_by_step: dict[int, int | None] = {}
+    interval_ptr = 0
+    current_peak: int | None = None
+
+    for step in sorted_steps:
+        while interval_ptr < len(completed_intervals) and completed_intervals[interval_ptr][1] < step:
+            current_peak = completed_intervals[interval_ptr][2]
+            interval_ptr += 1
+        peak_cp_by_step[step] = current_peak
+
+    return peak_cp_by_step
+
+
+def _precompute_entropy_peak_cp_by_threshold(
+    entropy_by_step: dict[int, float],
+    threshold: float,
+    min_interval_len: int = 15,
+    smooth_window: int = 5,
+) -> dict[int, int | None]:
+    """
+    通过硬阈值 (Threshold) 寻找 Safe Region，并提取该区域的 Peak Checkpoint。
+    完全模拟真机在线状态机的判断逻辑。
+    """
+    if not entropy_by_step:
+        return {}
+
+    sorted_steps = sorted(entropy_by_step.keys())
+
+    # Pass 1: 对原始 Entropy 进行简单的滑动窗口平滑 (防抖)
+    smoothed_entropy: dict[int, float] = {}
+    buffer: list[float] = []
+    for step in sorted_steps:
+        val = entropy_by_step[step]
+        if not math.isnan(val):
+            buffer.append(val)
+        if len(buffer) > smooth_window:
+            buffer.pop(0)
+
+        if buffer:
+            smoothed_entropy[step] = sum(buffer) / len(buffer)
+        else:
+            smoothed_entropy[step] = float("nan")
+
+    # Pass 2: 基于平滑后的阈值划分 Safe Region 并寻找 Peak
+    completed_intervals: list[tuple[int, int, int]] = []  # (start, end, peak_step)
+    in_free_run: list[int] = []
+
+    for step in sorted_steps:
+        val = smoothed_entropy[step]
+        if not math.isnan(val) and val > threshold:
+            in_free_run.append(step)
+        else:
+            if in_free_run:
+                if len(in_free_run) >= min_interval_len:
+                    # 找 Peak 时仍使用原始 Raw Entropy 取最真实极值点。
+                    peak_step = max(in_free_run, key=lambda s: entropy_by_step[s])
+                    completed_intervals.append((in_free_run[0], in_free_run[-1], peak_step))
+                in_free_run = []
+    # 故意不添加末尾未闭合区间，因为它还没结束。
+
+    # Pass 3: 为每个 Step 映射最新已闭合区间的 Peak 作为 Checkpoint
+    peak_cp_by_step: dict[int, int | None] = {}
+    interval_ptr = 0
+    current_peak: int | None = None
+
+    for step in sorted_steps:
+        while interval_ptr < len(completed_intervals) and completed_intervals[interval_ptr][1] < step:
+            current_peak = completed_intervals[interval_ptr][2]
+            interval_ptr += 1
+        peak_cp_by_step[step] = current_peak
+
+    return peak_cp_by_step
+
+
+def _compute_entropy_labels_by_step(
+    entropy_by_step: dict[int, float],
+    episodes: list[dict],
+    pipeline: str = "aloha",
+) -> dict[int, int]:
+    """Compute per-step HDBSCAN cluster labels from entropy values.
+
+    Uses the same clustering pipeline as ``compute_action_entropy_safe_threshold``
+    (either ``cluster_entropy_hdbscan_aloha`` or ``cluster_entropy_hdbscan_robobase``).
+
+    Returns:
+        dict mapping global_step → label where:
+          - 0: precision region (low entropy, contact / manipulation)
+          - 1: free region (high entropy / casual movement)
+        Steps that are noise or unlabeled (-1 before abs) are omitted.
+    """
+    try:
+        from tools.failure.metrics_compute import (
+            cluster_entropy_hdbscan_aloha,
+            cluster_entropy_hdbscan_robobase,
+        )
+    except ModuleNotFoundError:
+        from metrics_compute import (
+            cluster_entropy_hdbscan_aloha,
+            cluster_entropy_hdbscan_robobase,
+        )
+
+    cluster_fn = cluster_entropy_hdbscan_aloha if pipeline == "aloha" else cluster_entropy_hdbscan_robobase
+    label_by_step: dict[int, int] = {}
+
+    for ep_meta in episodes:
+        from_idx = int(
+            ep_meta["dataset_from_index"]
+            if not isinstance(ep_meta["dataset_from_index"], list)
+            else ep_meta["dataset_from_index"][0]
+        )
+        to_idx = int(
+            ep_meta["dataset_to_index"]
+            if not isinstance(ep_meta["dataset_to_index"], list)
+            else ep_meta["dataset_to_index"][0]
+        )
+        global_steps = list(range(from_idx, to_idx))
+        episode_entropy = np.array([entropy_by_step.get(s, float("nan")) for s in global_steps], dtype=float)
+
+        valid_mask = np.isfinite(episode_entropy)
+        valid_steps = [global_steps[k] for k in range(len(global_steps)) if valid_mask[k]]
+        valid_entropy = episode_entropy[valid_mask]
+
+        if len(valid_steps) < 5:
+            continue
+
+        labels = cluster_fn(valid_entropy)
+        for step, label in zip(valid_steps, labels, strict=False):
+            label_by_step[step] = int(label)
+
+    return label_by_step
 
 
 def _safe_int(value):
@@ -537,6 +706,7 @@ def visualize_dataset(
     repo_id,
     root=None,
     stride=7,
+    num_episode=None,
     checkpoint_signal_config=None,
     save_timing_plot=True,
     timing_plot_path=None,
@@ -561,6 +731,14 @@ def visualize_dataset(
         dataset.meta.episodes = load_episodes(dataset.root)
 
     total_episodes = len(dataset.meta.episodes)
+    if num_episode is None:
+        episodes_to_visualize = total_episodes
+    else:
+        if int(num_episode) <= 0:
+            raise ValueError("ERROR: num_episode must be a positive integer.")
+        episodes_to_visualize = min(int(num_episode), total_episodes)
+
+    print(f"Visualizing {episodes_to_visualize}/{total_episodes} episode(s).")
     dataset_root = Path(dataset.root)
     has_vlm_dir = (dataset_root / "vlm").exists()
     use_vlm_panels = False
@@ -789,6 +967,81 @@ def visualize_dataset(
 
     action_entropy_enabled = bool(entropy_jsonl_by_step or entropy_offline_by_step)
 
+    # Compute per-step HDBSCAN cluster labels (0=precision / 1=free) for both entropy sources.
+    entropy_labels_jsonl: dict[int, int] = {}
+    entropy_labels_offline: dict[int, int] = {}
+    if action_entropy_enabled and dataset.meta.episodes:
+        if entropy_jsonl_by_step:
+            print("[INFO] Computing HDBSCAN cluster labels for JSONL action entropy...")
+            entropy_labels_jsonl = _compute_entropy_labels_by_step(
+                entropy_jsonl_by_step, dataset.meta.episodes
+            )
+            _prec = sum(1 for v in entropy_labels_jsonl.values() if v == 0)
+            _free = sum(1 for v in entropy_labels_jsonl.values() if v >= 1)
+            print(f"[INFO] JSONL entropy labels: {_prec} precision, {_free} free steps")
+        if entropy_offline_by_step:
+            print("[INFO] Computing HDBSCAN cluster labels for offline action entropy...")
+            entropy_labels_offline = _compute_entropy_labels_by_step(
+                entropy_offline_by_step, dataset.meta.episodes
+            )
+            _prec = sum(1 for v in entropy_labels_offline.values() if v == 0)
+            _free = sum(1 for v in entropy_labels_offline.values() if v >= 1)
+            print(f"[INFO] Offline entropy labels: {_prec} precision, {_free} free steps")
+
+    if action_entropy_enabled:
+        pass
+
+    # Pre-compute entropy-based peak checkpoints independently for JSONL and offline.
+    entropy_peak_cp_jsonl_by_step: dict[int, int | None] = {}
+    entropy_peak_steps_jsonl: set[int] = set()
+    entropy_peak_cp_offline_by_step: dict[int, int | None] = {}
+    entropy_peak_steps_offline: set[int] = set()
+
+    if action_entropy_enabled and ae_safe_threshold is not None:
+        # 处理 JSONL 来源的 Entropy
+        if entropy_jsonl_by_step:
+            entropy_peak_cp_jsonl_by_step = _precompute_entropy_peak_cp_by_threshold(
+                entropy_by_step=entropy_jsonl_by_step,
+                threshold=ae_safe_threshold,
+                min_interval_len=15,
+                smooth_window=5,
+            )
+            entropy_peak_steps_jsonl = {
+                int(v) for v in entropy_peak_cp_jsonl_by_step.values() if v is not None
+            }
+            n_peaks_jsonl = len(entropy_peak_steps_jsonl)
+            print(
+                "[INFO] (Threshold Mode) Pre-computed JSONL peak checkpoints: "
+                f"found {n_peaks_jsonl} valid safe regions."
+            )
+
+        # 处理 Offline 来源的 Entropy
+        if entropy_offline_by_step:
+            entropy_peak_cp_offline_by_step = _precompute_entropy_peak_cp_by_threshold(
+                entropy_by_step=entropy_offline_by_step,
+                threshold=ae_safe_threshold,
+                min_interval_len=15,
+                smooth_window=5,
+            )
+            entropy_peak_steps_offline = {
+                int(v) for v in entropy_peak_cp_offline_by_step.values() if v is not None
+            }
+            n_peaks_offline = len(entropy_peak_steps_offline)
+            print(
+                "[INFO] (Threshold Mode) Pre-computed Offline peak checkpoints: "
+                f"found {n_peaks_offline} valid safe regions."
+            )
+    else:
+        print(
+            "[WARN] ae_safe_threshold is None or entropy disabled. Cannot compute threshold-based checkpoints."
+        )
+
+    if action_entropy_enabled and not (entropy_peak_steps_jsonl or entropy_peak_steps_offline):
+        print(
+            "[WARN] No completed free-labeled peaks found for marker rendering. "
+            "Consider lowering min_interval_len or checking entropy labels."
+        )
+
     if action_entropy_enabled:
         if entropy_offline_max_diff_by_step and max(entropy_offline_max_diff_by_step.values()) < 1e-8:
             print(
@@ -844,6 +1097,19 @@ def visualize_dataset(
                 rrb.Spatial2DView(name="Checkpoint -1", origin="checkpoints/cp_4"),
             )
 
+            if action_entropy_enabled and (entropy_peak_cp_jsonl_by_step or entropy_peak_cp_offline_by_step):
+                middle_right_panel = rrb.Vertical(
+                    rrb.Spatial2DView(
+                        name="JSONL Peak Checkpoint",
+                        origin="checkpoints/entropy_cp_jsonl",
+                    ),
+                    rrb.Spatial2DView(
+                        name="Offline Peak Checkpoint",
+                        origin="checkpoints/entropy_cp_offline",
+                    ),
+                    row_shares=[1, 1],
+                )
+
         blueprint = rrb.Blueprint(
             rrb.Horizontal(
                 rrb.Horizontal(
@@ -898,6 +1164,14 @@ def visualize_dataset(
             name="Episode ID",
             origin="overlay/episode_id",
         )
+        entropy_cp_jsonl_view = rrb.Spatial2DView(
+            name="JSONL Peak Checkpoint",
+            origin="checkpoints/entropy_cp_jsonl",
+        )
+        entropy_cp_offline_view = rrb.Spatial2DView(
+            name="Offline Peak Checkpoint",
+            origin="checkpoints/entropy_cp_offline",
+        )
         blueprint = rrb.Blueprint(
             rrb.Horizontal(
                 rrb.Vertical(
@@ -909,6 +1183,9 @@ def visualize_dataset(
                         name=checkpoint_curve_labels["metrics/action_entropy_max_diff_compare"],
                         origin="metrics/action_entropy_max_diff_compare",
                     ),
+                    entropy_cp_jsonl_view,
+                    entropy_cp_offline_view,
+                    row_shares=[3, 3, 2, 2],
                 ),
                 rrb.Vertical(*camera_views, id_overlay_view, row_shares=[6] * len(camera_views) + [1]),
                 column_shares=[1, 2],
@@ -954,14 +1231,46 @@ def visualize_dataset(
             static=True,
         )
 
+    if action_entropy_enabled:
+        rr.log(
+            "metrics/action_entropy_compare/jsonl/precision",
+            rr.SeriesPoints(colors=[100, 150, 255], markers="circle", marker_sizes=3.0),
+            static=True,
+        )
+        rr.log(
+            "metrics/action_entropy_compare/jsonl/free",
+            rr.SeriesPoints(colors=[255, 140, 0], markers="diamond", marker_sizes=3.0),
+            static=True,
+        )
+        rr.log(
+            "metrics/action_entropy_compare/offline/precision",
+            rr.SeriesPoints(colors=[0, 200, 100], markers="circle", marker_sizes=3.0),
+            static=True,
+        )
+        rr.log(
+            "metrics/action_entropy_compare/offline/free",
+            rr.SeriesPoints(colors=[255, 80, 80], markers="diamond", marker_sizes=3.0),
+            static=True,
+        )
+        rr.log(
+            "metrics/action_entropy_compare/jsonl/peak_cp_markers",
+            rr.SeriesPoints(colors=[0, 230, 60], markers="circle", marker_sizes=8.0),
+            static=True,
+        )
+        rr.log(
+            "metrics/action_entropy_compare/offline/peak_cp_markers",
+            rr.SeriesPoints(colors=[0, 230, 60], markers="circle", marker_sizes=8.0),
+            static=True,
+        )
+
     global_step = 0
     prev_attention_entropy = None
     prev_attention_step = None
 
     image_cache = {}
 
-    for episode_idx in range(total_episodes):
-        print(f"Streaming Episode {episode_idx}/{total_episodes}...", end="\r")
+    for episode_idx in range(episodes_to_visualize):
+        print(f"Streaming Episode {episode_idx}/{episodes_to_visualize}...", end="\r")
         ep_meta = dataset.meta.episodes[episode_idx]
         from_idx = int(
             ep_meta["dataset_from_index"]
@@ -978,6 +1287,10 @@ def visualize_dataset(
 
         def _collate_fn(batch):
             return batch[0]
+
+        # Default checkpoint for this episode: first frame.
+        # Superseded once a qualified free-interval peak is found.
+        episode_start_cp: int = from_idx
 
         loader = DataLoader(
             Subset(dataset, episode_indices),
@@ -1023,9 +1336,28 @@ def visualize_dataset(
             if concatenated_arr is not None:
                 image_cache[i] = rr.Image(concatenated_arr)
 
-            protected_checkpoint_steps: set[int] = set()
+            # Entropy-based peak checkpoints: previous completed free-labeled interval peaks
+            # for JSONL and offline sources, each falling back to the episode start frame.
+            entropy_peak_cp_jsonl: int | None = entropy_peak_cp_jsonl_by_step.get(i)
+            entropy_peak_cp_offline: int | None = entropy_peak_cp_offline_by_step.get(i)
+            effective_cp_jsonl: int = (
+                entropy_peak_cp_jsonl if entropy_peak_cp_jsonl is not None else episode_start_cp
+            )
+            effective_cp_offline: int = (
+                entropy_peak_cp_offline if entropy_peak_cp_offline is not None else episode_start_cp
+            )
+
+            protected_checkpoint_steps: set[int] = {
+                episode_start_cp,
+                effective_cp_jsonl,
+                effective_cp_offline,
+            }
+            if entropy_peak_cp_jsonl is not None:
+                protected_checkpoint_steps.add(entropy_peak_cp_jsonl)
+            if entropy_peak_cp_offline is not None:
+                protected_checkpoint_steps.add(entropy_peak_cp_offline)
             if failure_metrics:
-                protected_checkpoint_steps = {
+                protected_checkpoint_steps |= {
                     int(cp_step) for cp_step in recent_checkpoints_by_step.get(i, [])[-5:]
                 }
 
@@ -1041,22 +1373,46 @@ def visualize_dataset(
                 entropy_value_offline = entropy_offline_by_step.get(i)
                 sample_max_diff_offline = entropy_offline_max_diff_by_step.get(i)
 
+                is_entropy_peak_cp_jsonl = i in entropy_peak_steps_jsonl
+                is_entropy_peak_cp_offline = i in entropy_peak_steps_offline
+
                 if ae_safe_threshold is not None:
-                    # Plot a horizontal threshold line in the same chart as JSONL/offline entropy.
                     rr.log("metrics/action_entropy_compare/threshold", rr.Scalars(ae_safe_threshold))
 
                 if entropy_value_jsonl is not None:
                     rr.log("metrics/action_entropy_compare/jsonl", rr.Scalars(entropy_value_jsonl))
-                    if ae_safe_threshold is not None and entropy_value_jsonl > ae_safe_threshold:
+                    _lbl_jsonl = entropy_labels_jsonl.get(i, -1)
+                    if _lbl_jsonl == 0:
                         rr.log(
-                            "metrics/action_entropy_compare/jsonl/safe_region",
+                            "metrics/action_entropy_compare/jsonl/precision",
+                            rr.Scalars(entropy_value_jsonl),
+                        )
+                    elif _lbl_jsonl >= 1:
+                        rr.log(
+                            "metrics/action_entropy_compare/jsonl/free",
+                            rr.Scalars(entropy_value_jsonl),
+                        )
+                    if is_entropy_peak_cp_jsonl and _lbl_jsonl >= 1:
+                        rr.log(
+                            "metrics/action_entropy_compare/jsonl/peak_cp_markers",
                             rr.Scalars(entropy_value_jsonl),
                         )
                 if entropy_value_offline is not None:
                     rr.log("metrics/action_entropy_compare/offline", rr.Scalars(entropy_value_offline))
-                    if ae_safe_threshold is not None and entropy_value_offline > ae_safe_threshold:
+                    _lbl_offline = entropy_labels_offline.get(i, -1)
+                    if _lbl_offline == 0:
                         rr.log(
-                            "metrics/action_entropy_compare/offline/safe_region",
+                            "metrics/action_entropy_compare/offline/precision",
+                            rr.Scalars(entropy_value_offline),
+                        )
+                    elif _lbl_offline >= 1:
+                        rr.log(
+                            "metrics/action_entropy_compare/offline/free",
+                            rr.Scalars(entropy_value_offline),
+                        )
+                    if is_entropy_peak_cp_offline and _lbl_offline >= 1:
+                        rr.log(
+                            "metrics/action_entropy_compare/offline/peak_cp_markers",
                             rr.Scalars(entropy_value_offline),
                         )
                 if sample_max_diff_jsonl is not None:
@@ -1069,6 +1425,16 @@ def visualize_dataset(
                         "metrics/action_entropy_max_diff_compare/offline",
                         rr.Scalars(sample_max_diff_offline),
                     )
+
+                if effective_cp_jsonl in image_cache:
+                    rr.log("checkpoints/entropy_cp_jsonl", image_cache[effective_cp_jsonl])
+                else:
+                    rr.log("checkpoints/entropy_cp_jsonl", rr.Clear(recursive=False))
+
+                if effective_cp_offline in image_cache:
+                    rr.log("checkpoints/entropy_cp_offline", image_cache[effective_cp_offline])
+                else:
+                    rr.log("checkpoints/entropy_cp_offline", rr.Clear(recursive=False))
 
             if failure_metrics:
                 m = failure_metrics.get(i, {})
@@ -1142,14 +1508,18 @@ def visualize_dataset(
                     else:
                         _log_vlm_record_windows(None)
                 else:
-                    # Always check checkpoint queue and display latest 5 if available
-                    cps = recent_checkpoints_by_step.get(i, [])
-                    if cps:
-                        _log_checkpoint_windows(image_cache, recent_checkpoints_by_step, i)
+                    if action_entropy_enabled and (
+                        entropy_peak_cp_jsonl_by_step or entropy_peak_cp_offline_by_step
+                    ):
+                        # Entropy checkpoint panels are already updated above.
+                        pass
                     else:
-                        # Clear checkpoint display if no checkpoints in queue
-                        for cp_idx in range(5):
-                            rr.log(f"checkpoints/cp_{cp_idx}", rr.Clear(recursive=False))
+                        cps = recent_checkpoints_by_step.get(i, [])
+                        if cps:
+                            _log_checkpoint_windows(image_cache, recent_checkpoints_by_step, i)
+                        else:
+                            for cp_idx in range(5):
+                                rr.log(f"checkpoints/cp_{cp_idx}", rr.Clear(recursive=False))
 
     print("\nDone streaming to Rerun.")
 
@@ -1159,6 +1529,12 @@ if __name__ == "__main__":
     parser.add_argument("--repo_id", type=str, help="Dataset repository ID")
     parser.add_argument("--root", type=str, default=None, help="Dataset root")
     parser.add_argument("--stride", type=int, default=7, help="Visualization stride (speed)")
+    parser.add_argument(
+        "--num_episode",
+        type=int,
+        default=None,
+        help="Only visualize the first N episodes. Default: all episodes.",
+    )
     parser.add_argument(
         "--save_timing_plot",
         type=lambda x: str(x).lower() in {"1", "true", "yes", "y"},
@@ -1183,6 +1559,7 @@ if __name__ == "__main__":
         args.repo_id,
         args.root,
         args.stride,
+        num_episode=args.num_episode,
         save_timing_plot=args.save_timing_plot,
         timing_plot_path=args.timing_plot_path,
         timing_npz_path=args.timing_npz_path,

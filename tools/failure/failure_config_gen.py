@@ -69,7 +69,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--entropy_percentile",
         type=float,
-        default=95.0,
+        default=99.5,
         help="Percentile on clustered precision set for action entropy safe threshold. Default: 95",
     )
     parser.add_argument(
@@ -575,9 +575,6 @@ def main() -> None:
         ae_safe_threshold, p_count, ae_total = compute_action_entropy_safe_threshold(
             action_entropies,
             percentile=args.entropy_percentile,
-            min_cluster_size=args.entropy_min_cluster_size,
-            min_samples=args.entropy_min_samples,
-            plot=False,
         )
     else:
         print("[WARN] action_entropy unavailable. Will not update metrics.action_entropy.safe_threshold.")
