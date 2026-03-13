@@ -1,6 +1,5 @@
 import json
 import logging
-import math
 import time
 from collections import deque
 from pathlib import Path
@@ -17,45 +16,31 @@ logger = logging.getLogger(__name__)
 
 def _compute_action_entropy(
     action_samples: torch.Tensor,
-    min_bandwidth: float = 1e-5,
-    min_density: float = 1e-35,
+    bandwidth: float = 1.0,
+    min_density: float = 1e-8,
 ) -> torch.Tensor:
-    """KDE-based action entropy from overlapping chunk predictions.
+    """Estimate action entropy via isotropic Gaussian KDE.
 
-    Mirrors the paper-style procedure in tools/failure/action_entropy_memory.py
-    but operates on (M, D) tensors already assembled by the caller.
-
-    Args:
-        action_samples: Shape (M, D) — M overlapping predictions for the same
-            target timestep, each of dimension D (action_dim).
-        min_bandwidth: Lower-bound for Silverman bandwidth to prevent degenerate kernels.
-        min_density: Lower-bound for KDE density before log to avoid -inf.
-
-    Returns:
-        Scalar entropy estimate (torch.Tensor, 0-d).
+    100% Aligned with offline `compute_action_entropy_gpu` from robobase.
+    - isotropic bandwidth = 1
+    - squared Euclidean distance
     """
-    sample_count, action_dim = action_samples.shape
-    dtype = action_samples.dtype
-    device = action_samples.device
+    if action_samples.ndim != 2:
+        raise ValueError(f"Expected action_samples to have shape (M, D), got {tuple(action_samples.shape)}")
 
-    min_bw_t = torch.tensor(min_bandwidth, dtype=dtype, device=device)
-    min_density_t = torch.tensor(min_density, dtype=dtype, device=device)
-    gaussian_norm_t = torch.tensor(math.sqrt(2.0 * math.pi), dtype=dtype, device=device)
+    num_samples = action_samples.shape[0]
+    if num_samples == 0:
+        raise ValueError("Expected at least one action sample to estimate entropy")
 
-    sigma = torch.std(action_samples, dim=0, unbiased=sample_count > 1)
-    sigma = torch.clamp(sigma, min=min_bw_t)
-    bandwidth = torch.clamp(1.06 * sigma * (sample_count ** (-0.2)), min=min_bw_t)
+    x_i = action_samples.unsqueeze(1)  # (M, 1, D)
+    x_j = action_samples.unsqueeze(0)  # (1, M, D)
 
-    squared_mahalanobis = torch.zeros((sample_count, sample_count), dtype=dtype, device=device)
-    for dim_idx in range(action_dim):
-        vals = action_samples[:, dim_idx]
-        diffs = vals.unsqueeze(1) - vals.unsqueeze(0)
-        squared_mahalanobis = squared_mahalanobis + (diffs / bandwidth[dim_idx]) ** 2
+    distances = torch.sum((x_i - x_j) ** 2, dim=-1)  # (M, M)
 
-    log_kernel_norm = torch.log(bandwidth * gaussian_norm_t).sum()
-    kernel_vals = torch.exp(-0.5 * squared_mahalanobis - log_kernel_norm)
-    densities = torch.clamp(kernel_vals.mean(dim=1), min=min_density_t)
-    return -torch.log(densities).mean()
+    kernel_values = torch.exp(-distances / (2 * bandwidth**2))  # (M, M)
+
+    density = kernel_values.sum(dim=1) / num_samples  # (M,)
+    return -(torch.log(density + min_density)).mean()
 
 
 class FailureMetrics:
@@ -234,33 +219,24 @@ class FailureMetrics:
         jerk = torch.diff(acceleration, dim=1)
         return torch.norm(jerk, dim=-1).mean()
 
-    def get_action_chunk_entropy(
-        self, actions_chunk: torch.Tensor
-    ) -> tuple[float | torch.Tensor, float | torch.Tensor]:
+    def get_action_chunk_entropy(self, actions_chunk: torch.Tensor) -> tuple[float, float]:
         """Estimate action entropy and max sample diff from overlapping chunk predictions.
 
-        Maintains a rolling buffer (``recent_action_chunks``) of past action chunks.
-        For the current log-step ``s``, every chunk stored at source step ``t`` provides
-        a prediction at horizon ``s - t``.  All such overlapping single-step predictions
-        are collected and passed to the KDE-based entropy estimator.
-
-        Returns:
-            (entropy, max_diff): Both are 0.0 when the overlap count is below
-                config.metrics.action_entropy.min_overlap_samples.
+        Aligned with offline precomputation:
+        - Requires at least 3 overlapping samples.
+        - Returns (nan, nan) if insufficient overlaps, matching offline exactly.
         """
         if actions_chunk.dim() < 3:
-            return 0.0, 0.0
+            return float("nan"), float("nan")
 
-        ae_cfg = self.config.metrics.action_entropy
         chunk_size = actions_chunk.shape[1]
         current_step = self.step
 
-        # Episode start should always reset the overlap buffer even if global step is continuous.
+        # Episode start should always reset the overlap buffer
         if self.process_step == 0:
             self.recent_action_chunks.clear()
 
-        # Inference/logging can have discontinuities (episode boundary, recovery wait,
-        # dropped frames). Reset overlap buffer so stale chunks do not create fake spikes.
+        # Inference discontinuities reset overlap buffer
         if self.recent_action_chunks and current_step != self.recent_action_chunks[-1][0] + 1:
             self.recent_action_chunks.clear()
 
@@ -280,20 +256,21 @@ class FailureMetrics:
         for source_step, source_chunk in self.recent_action_chunks:
             horizon = current_step - source_step
             if 0 <= horizon < source_chunk.shape[1]:
-                overlapping.append(source_chunk[:, horizon, :])  # (1, action_dim)
+                overlapping.append(source_chunk[:, horizon, :])
 
-        min_overlap = max(2, int(ae_cfg.min_overlap_samples))
-        if len(overlapping) < min_overlap:
-            return 0.0, 0.0
+        if len(overlapping) < 3:
+            return float("nan"), float("nan")
 
         action_samples = torch.cat(overlapping, dim=0)  # (M, action_dim)
+
         entropy = _compute_action_entropy(
             action_samples,
-            min_bandwidth=ae_cfg.min_bandwidth,
-            min_density=ae_cfg.min_density,
+            bandwidth=1.0,
+            min_density=1e-8,
         )
         max_diff = torch.abs(action_samples - action_samples[0:1]).max()
-        return entropy, max_diff
+
+        return float(entropy.item()), float(max_diff.item())
 
     def get_checkpoint_metric_value(
         self,

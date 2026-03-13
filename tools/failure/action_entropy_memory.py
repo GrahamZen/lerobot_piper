@@ -1,4 +1,3 @@
-import math
 from collections import deque
 from collections.abc import Sequence
 from typing import Any
@@ -13,49 +12,40 @@ from lerobot.utils.constants import OBS_IMAGES
 
 def compute_action_entropy_gpu(
     action_samples: torch.Tensor,
-    min_bandwidth: float = 1e-5,
-    min_density: float = 1e-35,
+    bandwidth: float = 1.0,
+    min_density: float = 1e-8,
 ) -> torch.Tensor:
-    """Estimate paper-style conditional action entropy from overlapping predictions.
+    """Estimate action entropy via isotropic Gaussian KDE.
+
+    Matches the KDE.kde_entropy / gaussian_kernel implementation in
+    DemoSpeedup's robobase/robobase/utils.py:
+      - isotropic bandwidth = 1 (hardcoded scalar, same for all dims)
+      - squared Euclidean distance summed over all action dims
+      - kernel: exp(-dist / (2 * bandwidth^2))
+      - density = sum_over_neighbors / M
+      - entropy = -mean(log(density + 1e-8))
 
     Args:
         action_samples: Tensor of shape (M, D), where M is the number of overlapping
-            predictions for the same target timestep collected from the past K chunks.
+            predictions for the same target timestep.
 
     Returns:
-        Scalar entropy estimate matching the paper's KDE + -sum(p log p) procedure.
+        Scalar entropy estimate.
     """
     if action_samples.ndim != 2:
         raise ValueError(f"Expected action_samples to have shape (M, D), got {tuple(action_samples.shape)}")
 
-    sample_count, action_dim = action_samples.shape
-    if sample_count == 0:
+    num_samples = action_samples.shape[0]
+    if num_samples == 0:
         raise ValueError("Expected at least one action sample to estimate entropy")
 
-    dtype = action_samples.dtype
-    device = action_samples.device
-    min_bw_t = torch.tensor(min_bandwidth, dtype=dtype, device=device)
-    min_density_t = torch.tensor(min_density, dtype=dtype, device=device)
-    gaussian_norm_t = torch.tensor(math.sqrt(2.0 * math.pi), dtype=dtype, device=device)
+    x_i = action_samples.unsqueeze(1)  # (M, 1, D)
+    x_j = action_samples.unsqueeze(0)  # (1, M, D)
+    distances = torch.sum((x_i - x_j) ** 2, dim=-1)  # (M, M) squared Euclidean
+    kernel_values = torch.exp(-distances / (2 * bandwidth**2))  # (M, M)
 
-    sigma = torch.std(action_samples, dim=0, unbiased=sample_count > 1)
-    sigma = torch.clamp(sigma, min=min_bw_t)
-    bandwidth = torch.clamp(1.06 * sigma * (sample_count ** (-0.2)), min=min_bw_t)
-
-    squared_mahalanobis = torch.zeros(
-        (sample_count, sample_count),
-        dtype=dtype,
-        device=device,
-    )
-    for dim_idx in range(action_dim):
-        vals = action_samples[:, dim_idx]
-        diffs = vals.unsqueeze(1) - vals.unsqueeze(0)
-        squared_mahalanobis = squared_mahalanobis + (diffs / bandwidth[dim_idx]) ** 2
-
-    log_kernel_norm = torch.log(bandwidth * gaussian_norm_t).sum()
-    kernel_vals = torch.exp(-0.5 * squared_mahalanobis - log_kernel_norm)
-    densities = torch.clamp(kernel_vals.mean(dim=1), min=min_density_t)
-    return -torch.log(densities).mean()
+    density = kernel_values.sum(dim=1) / num_samples  # (M,)
+    return -(torch.log(density + min_density)).mean()
 
 
 def _collect_overlapping_predictions(
@@ -63,16 +53,23 @@ def _collect_overlapping_predictions(
     target_step: int,
     chunk_size: int,
 ) -> torch.Tensor:
+    """Collect all action samples for *target_step* from overlapping source predictions.
+
+    Each entry in *recent_predictions* stores (chunk_size, D).
+
+    Returns tensor of shape (K, D).
+    """
     overlapping_predictions = []
-    for source_step, source_actions in recent_predictions:
+    for source_step, source_samples in recent_predictions:
         horizon = target_step - source_step
         if 0 <= horizon < chunk_size:
-            overlapping_predictions.append(source_actions[horizon : horizon + 1, :])
+            # (chunk_size, D) -> (1, D)
+            overlapping_predictions.append(source_samples[horizon : horizon + 1, :])
 
     if not overlapping_predictions:
         raise RuntimeError(f"No overlapping predictions found for target step {target_step}")
 
-    return torch.cat(overlapping_predictions, dim=0)
+    return torch.cat(overlapping_predictions, dim=0)  # (K, D)
 
 
 def _collate_preprocessed_batch(preprocessed_items: list[dict[str, Any]]) -> dict[str, Any]:
@@ -117,7 +114,11 @@ def precompute_action_entropy_in_memory(
     indices: Sequence[int],
     batch_size: int = 16,
 ) -> tuple[dict[int, float], dict[int, float]]:
-    """Precompute entropy/max_diff for dataset indices with single-sample forward pass."""
+    """Precompute entropy/max_diff for dataset indices.
+
+    Uses ACT inference path directly (latent z=0) and computes KDE entropy over
+    overlapping predictions for the same target timestep.
+    """
     if not indices:
         return {}, {}
 
@@ -176,8 +177,6 @@ def precompute_action_entropy_in_memory(
         try:
             recent_predictions: deque[tuple[int, torch.Tensor]] = deque()
             for raw_items, step_indices in loader:
-                effective_batch_size = len(step_indices)
-
                 preprocessed = [preprocessor(item) for item in raw_items]
                 batch = _collate_preprocessed_batch(preprocessed)
 
@@ -191,9 +190,8 @@ def precompute_action_entropy_in_memory(
                 if policy.config.image_features:
                     batch_n[OBS_IMAGES] = [batch_n[key] for key in policy.config.image_features]
 
-                actions, _ = policy.model(batch_n)
-                _, _, action_dim = actions.shape
-                actions = actions.view(effective_batch_size, chunk_size, action_dim)
+                # ACT inference uses latent_sample=zeros internally.
+                all_actions, _ = policy.model(batch_n)  # (B, chunk_size, action_dim)
 
                 for offset, step in enumerate(step_indices):
                     step = int(step)
@@ -201,7 +199,8 @@ def precompute_action_entropy_in_memory(
                         recent_predictions.clear()
                     if recent_predictions and step != recent_predictions[-1][0] + 1:
                         recent_predictions.clear()
-                    recent_predictions.append((step, actions[offset]))
+                    # Store (chunk_size, D) — one prediction chunk per source step.
+                    recent_predictions.append((step, all_actions[offset]))
                     while recent_predictions and step - recent_predictions[0][0] >= chunk_size:
                         recent_predictions.popleft()
 
@@ -211,7 +210,7 @@ def precompute_action_entropy_in_memory(
                         chunk_size=chunk_size,
                     )
                     if overlapping_predictions.shape[0] < 3:
-                        entropy_by_step[step] = float("nan")  # 替换掉 0.0
+                        entropy_by_step[step] = float("nan")
                         max_diff_by_step[step] = float("nan")
                         progress.update(1)
                         continue
