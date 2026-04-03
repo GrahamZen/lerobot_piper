@@ -107,6 +107,7 @@ class MetricsRecorder:
         dropped = before - len(self._buffer)
 
         if dropped > 0:
+            self.global_step -= dropped
             logger.info("Discarded %d buffered metric rows for episode %d", dropped, self.episode)
 
         if self.last_row is not None and self.last_row.get("episode") == self.episode:

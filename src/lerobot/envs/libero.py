@@ -150,13 +150,13 @@ class LiberoEnv(gym.Env):
 
         self.init_state_id = self.episode_index  # tie each sub-env to a fixed init state
 
-        self._env = self._make_envs_task(task_suite, self.task_id)
         default_steps = 500
         self._max_episode_steps = (
             TASK_SUITE_MAX_STEPS.get(task_suite_name, default_steps)
             if self.episode_length is None
             else self.episode_length
         )
+        self._env = self._make_envs_task(task_suite, self.task_id)
         self.control_mode = control_mode
         images = {}
         for cam in self.camera_name:
@@ -237,6 +237,7 @@ class LiberoEnv(gym.Env):
             "bddl_file_name": task_bddl_file,
             "camera_heights": self.observation_height,
             "camera_widths": self.observation_width,
+            "horizon": self._max_episode_steps + self.num_steps_wait,
         }
         env = OffScreenRenderEnv(**env_args)
         env.reset()
@@ -348,6 +349,40 @@ class LiberoEnv(gym.Env):
             self.reset()
         truncated = False
         return observation, reward, terminated, truncated, info
+
+    def get_abs_state(self) -> dict:
+        """Snapshot the robot joint state (arm + gripper only, NOT objects).
+
+        Called by the eval loop before each policy step so that
+        FailurePostprocessor can checkpoint the robot pose for potential recovery.
+        Only robot joints are saved so that recovery does not teleport scene objects.
+        """
+        sim = self._env.sim
+        robot = self._env.robots[0]
+        arm_pos_idx = robot._ref_joint_pos_indexes
+        arm_vel_idx = robot._ref_joint_vel_indexes
+        gripper_pos_idx = robot._ref_gripper_joint_pos_indexes
+        gripper_vel_idx = robot._ref_gripper_joint_vel_indexes
+        return {
+            "arm_qpos": sim.data.qpos[arm_pos_idx].copy(),
+            "arm_qvel": sim.data.qvel[arm_vel_idx].copy(),
+            "gripper_qpos": sim.data.qpos[gripper_pos_idx].copy(),
+            "gripper_qvel": sim.data.qvel[gripper_vel_idx].copy(),
+        }
+
+    def set_abs_state(self, state: dict) -> None:
+        """Restore robot joint state from a checkpoint snapshot (for failure recovery).
+
+        Only writes robot arm and gripper joints; scene objects are left untouched.
+        Calls ``sim.forward()`` to recompute derived quantities (EEF pose, Jacobians, etc.).
+        """
+        sim = self._env.sim
+        robot = self._env.robots[0]
+        sim.data.qpos[robot._ref_joint_pos_indexes] = state["arm_qpos"]
+        sim.data.qvel[robot._ref_joint_vel_indexes] = state["arm_qvel"]
+        sim.data.qpos[robot._ref_gripper_joint_pos_indexes] = state["gripper_qpos"]
+        sim.data.qvel[robot._ref_gripper_joint_vel_indexes] = state["gripper_qvel"]
+        sim.forward()
 
     def close(self):
         self._env.close()

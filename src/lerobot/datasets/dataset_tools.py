@@ -475,6 +475,12 @@ def _copy_and_reindex_data(
 ) -> dict[int, dict]:
     """Copy and filter data files, only modifying files with deleted episodes.
 
+    Handles datasets where the metadata's data/chunk_index and data/file_index may not correctly
+    map to the parquet files that actually contain the episode data (e.g. aggregated datasets
+    like HuggingFaceVLA/libero). Instead of relying on metadata file paths, this scans all
+    parquet data files to find which files contain the requested episodes by checking the
+    episode_index column directly.
+
     Args:
         src_dataset: Source dataset to copy from
         dst_meta: Destination metadata object
@@ -486,12 +492,23 @@ def _copy_and_reindex_data(
     if src_dataset.meta.episodes is None:
         src_dataset.meta.episodes = load_episodes(src_dataset.meta.root)
 
+    old_episode_set = set(episode_mapping.keys())
+
+    # Scan all parquet data files to build accurate episode-to-file mapping.
+    # This is necessary because metadata's data/chunk_index and data/file_index may be
+    # incorrect for aggregated datasets.
+    data_dir = src_dataset.root / DATA_DIR
+    all_parquet_files = sorted(data_dir.glob("*/*.parquet"))
+
     file_to_episodes: dict[Path, set[int]] = {}
-    for old_idx in episode_mapping:
-        file_path = src_dataset.meta.get_data_file_path(old_idx)
-        if file_path not in file_to_episodes:
-            file_to_episodes[file_path] = set()
-        file_to_episodes[file_path].add(old_idx)
+    for parquet_path in all_parquet_files:
+        rel_path = parquet_path.relative_to(src_dataset.root)
+        # Quick check: read only the episode_index column to see if this file has any episodes we need
+        ep_col = pd.read_parquet(parquet_path, columns=["episode_index"])
+        file_episodes = set(ep_col["episode_index"].unique().tolist())
+        overlap = file_episodes & old_episode_set
+        if overlap:
+            file_to_episodes[rel_path] = overlap
 
     global_index = 0
     episode_data_metadata: dict[int, dict] = {}
@@ -500,7 +517,7 @@ def _copy_and_reindex_data(
         all_task_indices = set()
         for src_path in file_to_episodes:
             df = pd.read_parquet(src_dataset.root / src_path)
-            mask = df["episode_index"].isin(list(episode_mapping.keys()))
+            mask = df["episode_index"].isin(list(old_episode_set))
             task_series: pd.Series = df[mask]["task_index"]
             all_task_indices.update(task_series.unique().tolist())
         tasks = [src_dataset.meta.tasks.iloc[idx].name for idx in all_task_indices]
@@ -516,20 +533,15 @@ def _copy_and_reindex_data(
     for src_path in tqdm(sorted(file_to_episodes.keys()), desc="Processing data files"):
         df = pd.read_parquet(src_dataset.root / src_path)
 
-        all_episodes_in_file = set(df["episode_index"].unique())
+        all_episodes_in_file = set(df["episode_index"].unique().tolist())
         episodes_to_keep = file_to_episodes[src_path]
 
         if all_episodes_in_file == episodes_to_keep:
             df["episode_index"] = df["episode_index"].replace(episode_mapping)
             df["index"] = range(global_index, global_index + len(df))
             df["task_index"] = df["task_index"].replace(task_mapping)
-
-            first_ep_old_idx = min(episodes_to_keep)
-            src_ep = src_dataset.meta.episodes[first_ep_old_idx]
-            chunk_idx = src_ep["data/chunk_index"]
-            file_idx = src_ep["data/file_index"]
         else:
-            mask = df["episode_index"].isin(list(episode_mapping.keys()))
+            mask = df["episode_index"].isin(list(old_episode_set))
             df = df[mask].copy().reset_index(drop=True)
 
             if len(df) == 0:
@@ -539,10 +551,10 @@ def _copy_and_reindex_data(
             df["index"] = range(global_index, global_index + len(df))
             df["task_index"] = df["task_index"].replace(task_mapping)
 
-            first_ep_old_idx = min(episodes_to_keep)
-            src_ep = src_dataset.meta.episodes[first_ep_old_idx]
-            chunk_idx = src_ep["data/chunk_index"]
-            file_idx = src_ep["data/file_index"]
+        # Derive chunk_index and file_index from the source path
+        parts = src_path.parts  # e.g. ('data', 'chunk-000', 'file-037.parquet')
+        chunk_idx = int(parts[1].split("-")[1])
+        file_idx = int(parts[2].split("-")[1].split(".")[0])
 
         dst_path = dst_meta.root / DEFAULT_DATA_PATH.format(chunk_index=chunk_idx, file_index=file_idx)
         dst_path.parent.mkdir(parents=True, exist_ok=True)

@@ -74,9 +74,20 @@ class FailurePostprocessor:
         self.recovery_pending_wait: bool = False
         self.playback_mode: bool = False
         self._step: int = 0  # Episode-local step counter
+        self._pending_abs_state: Any = None  # Set by eval loop before each select_action()
 
         print(f"FailurePostprocessor config: {failure_handling_json_path or '(defaults)'}")
         pprint.pprint(dataclasses.asdict(self.config))
+
+    def set_pending_abs_state(self, abs_state: Any) -> None:
+        """Store the current per-env absolute sim state snapshot.
+
+        Called from the eval loop *before* ``policy.select_action()`` so that
+        ``_process_live`` can forward it to the strategy for checkpointing.
+        ``abs_state`` is typically a list of dicts (one per env) with
+        ``qpos``/``qvel`` arrays returned by ``LiberoEnv.get_abs_state()``.
+        """
+        self._pending_abs_state = abs_state
 
     # ------------------------------------------------------------------
     # Main entry point (called from ACTPolicy.select_action)
@@ -153,8 +164,8 @@ class FailurePostprocessor:
             **plugin_metrics,
         }
 
-        # Update checkpoint strategy
-        self.strategy.update(self._step, intended_action, all_metrics)
+        # Update checkpoint strategy (pass abs state so slot stores it for recovery)
+        self.strategy.update(self._step, intended_action, all_metrics, abs_state=self._pending_abs_state)
         all_metrics["best_slot_timestep"] = self.strategy.best_slot_timestep
         self.strategy.reset_step_state()
         for p in self.plugins:

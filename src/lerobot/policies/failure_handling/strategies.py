@@ -82,8 +82,14 @@ class BaseCheckpointStrategy(ABC):
         """
 
     @abstractmethod
-    def update(self, step: int, action: Tensor, all_metrics: dict[str, Any]) -> None:
-        """Decide whether to save a checkpoint based on *all_metrics*."""
+    def update(self, step: int, action: Tensor, all_metrics: dict[str, Any], abs_state: Any = None) -> None:
+        """Decide whether to save a checkpoint based on *all_metrics*.
+
+        abs_state: Per-env absolute sim state snapshot (e.g. list of dicts with
+            ``qpos``/``qvel`` from ``LiberoEnv.get_abs_state()``).  When provided,
+            the slot stores this for direct state-restore on recovery instead of
+            replaying the (potentially invalid) delta action.
+        """
 
     @abstractmethod
     def reset_step_state(self) -> None:
@@ -96,6 +102,14 @@ class BaseCheckpointStrategy(ABC):
     @abstractmethod
     def select_recovery_action(self, device) -> Tensor | None:
         """Return the best recovery action, or None if none is available."""
+
+    def select_recovery_abs_state(self) -> Any:
+        """Return the abs_state stored with the best recovery slot, or None.
+
+        Default implementation returns None (no abs state available).
+        Concrete strategies override this when they store abs_state in slots.
+        """
+        return None
 
     @abstractmethod
     def flush(self, output_dir: Path) -> None:
@@ -354,7 +368,7 @@ class _ListSlotStrategy(BaseCheckpointStrategy, ABC):
     def on_episode_start(self, initial_action: Tensor) -> None:
         self._fallback_action = initial_action.detach().cpu().clone()
 
-    def update(self, step: int, action: Tensor, all_metrics: dict[str, Any]) -> None:
+    def update(self, step: int, action: Tensor, all_metrics: dict[str, Any], abs_state: Any = None) -> None:
         if self.feat_template is None:
             return
         raw_sim = all_metrics.get(self._sim_metric_key, 0.0)
@@ -365,12 +379,16 @@ class _ListSlotStrategy(BaseCheckpointStrategy, ABC):
         if not self._slots:
             self._init_slots(sim.shape[0])
 
-        action_clone = action.detach().cpu().clone()
+        # When abs_state is provided (e.g. libero delta-action envs), store it directly as
+        # the checkpoint value.  The abs_state (qpos/qvel dict) is the sole recovery payload;
+        # the delta action is meaningless for recovery in that setting.
+        # For envs without abs_state support, fall back to storing the delta action tensor.
+        checkpoint_value = abs_state if abs_state is not None else action.detach().cpu().clone()
         for i, s in enumerate(sim.tolist()):
             if s > self._slots[i]["max_sim"]:
                 self._slots[i]["max_sim"] = s
                 self._slots[i]["timestep"] = step
-                self._slots[i]["action"] = action_clone
+                self._slots[i]["action"] = checkpoint_value
 
         self._sim_records.append({"episode": self._episode, "step": step, "sim": sim.cpu()})
 
@@ -409,10 +427,26 @@ class _ListSlotStrategy(BaseCheckpointStrategy, ABC):
                     f"[Recovery/{self.name}] checkpoint step={slot['timestep']} "
                     f"sim={slot['max_sim']:.4f} (latest peak slot {self._latest_peak_slot_idx})"
                 )
+                # If action is not a Tensor it's an abs_state snapshot (list/dict from env) —
+                # return fallback tensor as placeholder so _do_recovery() sets
+                # recovery_pending_wait.  The real restore happens in the eval loop via
+                # select_recovery_abs_state().
+                if not isinstance(slot["action"], Tensor):
+                    if self._fallback_action is not None:
+                        return self._fallback_action.to(device)
+                    return None
                 return slot["action"].to(device)
         if self._fallback_action is not None:
             logger.warning("%s: no peaked slot found — using fallback action", self.name)
             return self._fallback_action.to(device)
+        return None
+
+    def select_recovery_abs_state(self) -> Any:
+        """Return the abs_state stored in the best slot, or None if a delta Tensor was stored."""
+        if self._latest_peak_slot_idx >= 0 and self._slots:
+            action = self._slots[self._latest_peak_slot_idx]["action"]
+            if not isinstance(action, Tensor):
+                return action
         return None
 
     def flush(self, output_dir: Path) -> None:
@@ -481,7 +515,7 @@ class _TensorSlotStrategy(BaseCheckpointStrategy, ABC):
         self._slot_max_sim: Tensor | None = None
         self._slot_timestep: Tensor | None = None
         self._slot_was_peak: Tensor | None = None
-        self._slot_actions: list = []
+        self._slot_actions: list = []  # stores abs_state dict OR delta Tensor per slot
         self._latest_peak_slot_idx: int = -1
 
         self._load_template(model_dir)
@@ -557,7 +591,7 @@ class _TensorSlotStrategy(BaseCheckpointStrategy, ABC):
         self._slot_max_sim = torch.full((n,), float("-inf"))
         self._slot_timestep = torch.full((n,), -1, dtype=torch.long)
         self._slot_was_peak = torch.zeros(n, dtype=torch.bool)
-        self._slot_actions = [None] * n
+        self._slot_actions = [None] * n  # stores abs_state dict OR delta Tensor per slot
 
     # --- BaseCheckpointStrategy interface ---
 
@@ -568,7 +602,7 @@ class _TensorSlotStrategy(BaseCheckpointStrategy, ABC):
     def on_episode_start(self, initial_action: Tensor) -> None:
         self._fallback_action = initial_action.detach().cpu().clone()
 
-    def update(self, step: int, action: Tensor, all_metrics: dict[str, Any]) -> None:
+    def update(self, step: int, action: Tensor, all_metrics: dict[str, Any], abs_state: Any = None) -> None:
         if self.feat_template is None or not torch.is_tensor(self.last_similarity):
             return
 
@@ -579,11 +613,12 @@ class _TensorSlotStrategy(BaseCheckpointStrategy, ABC):
         if len(indices) == 0:
             return
 
-        action_cpu = action.detach().cpu().clone()
+        # Store abs_state directly when available; fall back to delta action otherwise.
+        checkpoint_value = abs_state if abs_state is not None else action.detach().cpu().clone()
         self._slot_max_sim[indices] = sim[indices]
         for idx in indices.tolist():
             self._slot_timestep[idx] = step
-            self._slot_actions[idx] = action_cpu
+            self._slot_actions[idx] = checkpoint_value
 
         # Check if the slot with the highest current-step similarity has peaked
         threshold = self._config.peak_timestep_threshold
@@ -622,10 +657,26 @@ class _TensorSlotStrategy(BaseCheckpointStrategy, ABC):
                 f"[Recovery/{self.name}] checkpoint step={int(self._slot_timestep[idx].item())} "
                 f"sim={float(self._slot_max_sim[idx].item()):.4f} (latest peak slot {idx})"
             )
+            # If action is not a Tensor it's an abs_state snapshot (list/dict from env) —
+            # return fallback tensor as placeholder so _do_recovery() sets
+            # recovery_pending_wait.  The real restore happens in the eval loop via
+            # select_recovery_abs_state().
+            if not isinstance(self._slot_actions[idx], Tensor):
+                if self._fallback_action is not None:
+                    return self._fallback_action.to(device)
+                return None
             return self._slot_actions[idx].to(device)
         if self._fallback_action is not None:
             logger.warning("%s: no peaked slot found — using fallback", self.name)
             return self._fallback_action.to(device)
+        return None
+
+    def select_recovery_abs_state(self) -> Any:
+        """Return the abs_state stored in the best slot, or None if a delta Tensor was stored."""
+        if self._latest_peak_slot_idx >= 0 and self._slot_actions:
+            action = self._slot_actions[self._latest_peak_slot_idx]
+            if not isinstance(action, Tensor):
+                return action
         return None
 
     def flush(self, output_dir: Path) -> None:

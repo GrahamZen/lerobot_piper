@@ -509,6 +509,101 @@ python examples/rtc/eval_with_real_robot.py \
   --device=cuda
 ```
 
+## 10.5 Simulation Training & Evaluation (LIBERO)
+
+This section covers the full pipeline for training and evaluating policies in simulation using the LIBERO benchmark: extracting a task-specific dataset, training an ACT policy, and collecting inference results.
+
+### Step 1: Extract Task-Specific Dataset
+
+The LIBERO dataset (`HuggingFaceVLA/libero`) contains multiple tasks mixed together. Use the provided tool to list all tasks and split out the one you want.
+
+List all tasks with episode counts, LIBERO suite, and task index (sorted descending):
+
+```bash
+uv run python tools/split_dataset_by_task.py HuggingFaceVLA/libero
+```
+
+Example output:
+
+```
+  Episodes  env.task          task_id  Task Name
+--------------------------------------------------------------------------------------------------------------
+        50  libero_10               3  turn on the stove
+        49  libero_10               1  put both the cream cheese box and the butter in the basket
+        43  libero_10               2  put both the alphabet soup and the cream cheese box in the basket
+       ...
+```
+
+Extract episodes for a specific task (supports substring match). If the local dataset already exists it is **skipped automatically**. The script also prints a ready-to-use training command with the correct `--env.task` and `--env.task_ids` filled in:
+
+```bash
+uv run python tools/split_dataset_by_task.py HuggingFaceVLA/libero \
+  --taskname "put both the alphabet soup and the cream cheese box in the basket"
+```
+
+The split dataset is saved to `~/.cache/huggingface/lerobot/local/libero_<task_slug>/`.
+
+### Step 2: Train ACT Policy in Simulation
+
+Copy the training command printed by Step 1 directly. The `--env.task` and `--env.task_ids` are automatically resolved from the LIBERO benchmark. Example for task index 2 in `libero_10`:
+
+```bash
+uv run lerobot-train \
+  --policy.type=act \
+  --env.type=libero \
+  --env.task=libero_10 \
+  --env.task_ids="[2]" \
+  --dataset.repo_id=local/libero_put_both_the_alphabet_soup_and_the_cream_cheese_box_in_the_b \
+  --output_dir=outputs/train/libero_put_both_the_alphabet_soup_and_the_cream_cheese_box_in_the_b \
+  --job_name=act_libero_put_both_the_alphabet_soup_and_the_cream_cheese_box_in_the_b \
+  --wandb.mode=offline \
+  --policy.push_to_hub=false \
+  --dataset.image_transforms.enable=true \
+  --policy.use_amp=false \
+  --batch_size=16 \
+  --steps=15000 \
+  --eval_freq=1500 \
+  --save_freq=1500 \
+  --eval.batch_size=20 \
+  --eval.n_episodes=20
+```
+
+Key parameters:
+
+- `--env.task`: LIBERO suite name (`libero_spatial`, `libero_object`, `libero_goal`, `libero_10`, `libero_90`)
+- `--env.task_ids`: Task index within the suite (0-based), shown in the Step 1 table
+- `--eval_freq`: Run simulation evaluation every N training steps
+- `--eval.n_episodes`: Number of rollout episodes per evaluation
+
+### Step 3: Collect Inference Results in Simulation
+
+After training, run `lerobot-sim-eval` to evaluate the final checkpoint and save the rollout dataset for analysis.
+
+```bash
+uv run lerobot-sim-eval \
+    --policy.path=outputs/train/libero_cream_cheese_box_butter1/checkpoints/last/pretrained_model \
+    --env.type=libero \
+    --env.task=libero_10 \
+    --env.task_ids="[1]" \
+    --eval.batch_size=1 \
+    --eval.n_episodes=20 \
+    --policy.use_amp=false \
+    --policy.device=cuda \
+    --dataset.repo_id=eval/libero_cream_cheese_box_butter_test \
+    --dataset.single_task="Pick up the cream cheese box and the butter" \
+    --display_data=true \
+    --policy.chunk_size=50 \
+    --policy.n_action_steps=1 \
+    --policy.temporal_ensemble_coeff=0.01
+```
+
+Key parameters:
+
+- `--policy.path`: Path to the trained model checkpoint
+- `--dataset.repo_id`: Where to save the evaluation rollout dataset
+- `--policy.n_action_steps=1` + `--policy.temporal_ensemble_coeff`: Enable temporal ensemble for smoother inference (recommended for evaluation)
+- `--display_data`: Render simulation visually during evaluation
+
 ## 11. Async Inference (Insufficient local VRAM)
 
 ### Installation

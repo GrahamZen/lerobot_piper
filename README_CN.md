@@ -489,6 +489,101 @@ python examples/rtc/eval_with_real_robot.py \
   --device=cuda
 ```
 
+## 10.5 仿真训练与评估（LIBERO）
+
+本节介绍在 LIBERO 仿真环境中的完整流程：从多任务数据集中提取单任务数据、训练 ACT 策略、再到收集推理结果。
+
+### 第一步：提取单任务数据集
+
+LIBERO 数据集（`HuggingFaceVLA/libero`）中混合了多个任务。使用工具脚本列出所有任务并提取所需任务的 episodes。
+
+列出所有任务，含 episode 数量、所属套件及任务编号（按数量降序排列）：
+
+```bash
+uv run python tools/split_dataset_by_task.py HuggingFaceVLA/libero
+```
+
+示例输出：
+
+```
+  Episodes  env.task          task_id  Task Name
+--------------------------------------------------------------------------------------------------------------
+        50  libero_10               3  turn on the stove
+        49  libero_10               1  put both the cream cheese box and the butter in the basket
+        43  libero_10               2  put both the alphabet soup and the cream cheese box in the basket
+       ...
+```
+
+按任务名提取（支持子字符串模糊匹配）。若本地数据集已存在则**自动跳过**，同时输出已填好 `--env.task` 和 `--env.task_ids` 的训练命令：
+
+```bash
+uv run python tools/split_dataset_by_task.py HuggingFaceVLA/libero \
+  --taskname "put both the alphabet soup and the cream cheese box in the basket"
+```
+
+提取后的数据集保存到 `~/.cache/huggingface/lerobot/local/libero_<task_slug>/`。
+
+### 第二步：在仿真中训练 ACT 策略
+
+直接复制第一步输出的训练命令即可，`--env.task` 和 `--env.task_ids` 已自动从 LIBERO benchmark 中解析。以 `libero_10` 第 2 号任务为例：
+
+```bash
+uv run lerobot-train \
+  --policy.type=act \
+  --env.type=libero \
+  --env.task=libero_10 \
+  --env.task_ids="[2]" \
+  --dataset.repo_id=local/libero_put_both_the_alphabet_soup_and_the_cream_cheese_box_in_the_b \
+  --output_dir=outputs/train/libero_put_both_the_alphabet_soup_and_the_cream_cheese_box_in_the_b \
+  --job_name=act_libero_put_both_the_alphabet_soup_and_the_cream_cheese_box_in_the_b \
+  --wandb.mode=offline \
+  --policy.push_to_hub=false \
+  --dataset.image_transforms.enable=true \
+  --policy.use_amp=false \
+  --batch_size=16 \
+  --steps=15000 \
+  --eval_freq=1500 \
+  --save_freq=1500 \
+  --eval.batch_size=20 \
+  --eval.n_episodes=20
+```
+
+关键参数说明：
+
+- `--env.task`: LIBERO 任务套件名（`libero_spatial`、`libero_object`、`libero_goal`、`libero_10`、`libero_90`）
+- `--env.task_ids`: 套件内任务编号（从 0 开始），在第一步的表格中可查看
+- `--eval_freq`: 每隔 N 步在仿真中做一次评估
+- `--eval.n_episodes`: 每次评估的 rollout 次数
+
+### 第三步：收集仿真推理结果
+
+训练完成后，使用 `lerobot-sim-eval` 对最终 checkpoint 进行评估，并将 rollout 数据集保存下来以便分析。
+
+```bash
+uv run lerobot-sim-eval \
+    --policy.path=outputs/train/libero_cream_cheese_box_butter1/checkpoints/last/pretrained_model \
+    --env.type=libero \
+    --env.task=libero_10 \
+    --env.task_ids="[1]" \
+    --eval.batch_size=1 \
+    --eval.n_episodes=20 \
+    --policy.use_amp=false \
+    --policy.device=cuda \
+    --dataset.repo_id=eval/libero_cream_cheese_box_butter_test \
+    --dataset.single_task="Pick up the cream cheese box and the butter" \
+    --display_data=true \
+    --policy.chunk_size=50 \
+    --policy.n_action_steps=1 \
+    --policy.temporal_ensemble_coeff=0.01
+```
+
+关键参数说明：
+
+- `--policy.path`: 训练好的模型 checkpoint 路径
+- `--dataset.repo_id`: 保存评估 rollout 数据集的位置
+- `--policy.n_action_steps=1` + `--policy.temporal_ensemble_coeff`: 开启时序集成（temporal ensemble），推理更平滑（评估时推荐）
+- `--display_data`: 评估时可视化仿真画面
+
 ## 11.异步推理（本地推理显存不够）
 
 ### 安装
