@@ -32,6 +32,13 @@ from libero.libero.envs import OffScreenRenderEnv
 from lerobot.processor import RobotObservation
 
 
+def _flatten_gripper_idx(idx) -> np.ndarray:
+    """Flatten gripper joint indexes regardless of whether they are a list, array, or dict of lists."""
+    if isinstance(idx, dict):
+        idx = [i for v in idx.values() for i in (v if hasattr(v, "__iter__") else [v])]
+    return np.array(idx, dtype=int).flatten()
+
+
 def _parse_camera_names(camera_name: str | Sequence[str]) -> list[str]:
     """Normalize camera_name into a non-empty list of strings."""
     if isinstance(camera_name, str):
@@ -359,10 +366,10 @@ class LiberoEnv(gym.Env):
         """
         sim = self._env.sim
         robot = self._env.robots[0]
-        arm_pos_idx = robot._ref_joint_pos_indexes
-        arm_vel_idx = robot._ref_joint_vel_indexes
-        gripper_pos_idx = robot._ref_gripper_joint_pos_indexes
-        gripper_vel_idx = robot._ref_gripper_joint_vel_indexes
+        arm_pos_idx = np.array(robot._ref_joint_pos_indexes, dtype=int)
+        arm_vel_idx = np.array(robot._ref_joint_vel_indexes, dtype=int)
+        gripper_pos_idx = _flatten_gripper_idx(robot._ref_gripper_joint_pos_indexes)
+        gripper_vel_idx = _flatten_gripper_idx(robot._ref_gripper_joint_vel_indexes)
         return {
             "arm_qpos": sim.data.qpos[arm_pos_idx].copy(),
             "arm_qvel": sim.data.qvel[arm_vel_idx].copy(),
@@ -378,10 +385,10 @@ class LiberoEnv(gym.Env):
         """
         sim = self._env.sim
         robot = self._env.robots[0]
-        sim.data.qpos[robot._ref_joint_pos_indexes] = state["arm_qpos"]
-        sim.data.qvel[robot._ref_joint_vel_indexes] = state["arm_qvel"]
-        sim.data.qpos[robot._ref_gripper_joint_pos_indexes] = state["gripper_qpos"]
-        sim.data.qvel[robot._ref_gripper_joint_vel_indexes] = state["gripper_qvel"]
+        sim.data.qpos[np.array(robot._ref_joint_pos_indexes, dtype=int)] = state["arm_qpos"]
+        sim.data.qvel[np.array(robot._ref_joint_vel_indexes, dtype=int)] = state["arm_qvel"]
+        sim.data.qpos[_flatten_gripper_idx(robot._ref_gripper_joint_pos_indexes)] = state["gripper_qpos"]
+        sim.data.qvel[_flatten_gripper_idx(robot._ref_gripper_joint_vel_indexes)] = state["gripper_qvel"]
         sim.forward()
 
     def close(self):

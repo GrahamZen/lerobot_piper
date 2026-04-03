@@ -62,6 +62,7 @@ import einops
 import gymnasium as gym
 import numpy as np
 import rerun as rr
+import rerun.blueprint as rrb
 import torch
 from termcolor import colored
 from torch import Tensor, nn
@@ -82,7 +83,7 @@ from lerobot.envs.utils import (
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.processor import PolicyAction, PolicyProcessorPipeline
-from lerobot.utils.constants import ACTION, OBS_STR
+from lerobot.utils.constants import ACTION, OBS_PREFIX, OBS_STR
 from lerobot.utils.control_utils import init_keyboard_listener
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.io_utils import write_video
@@ -174,6 +175,7 @@ def rollout(
     dataset: LeRobotDataset | None = None,
     dataset_task: str = "",
     save_only_success: bool = True,
+    rr_step_offset: int = 0,
 ) -> dict:
     """Batched policy rollout with failure recovery support.
 
@@ -217,6 +219,14 @@ def rollout(
     check_env_attributes_and_types(env)
     _fp = getattr(policy, "_failure_postprocessor", None)
 
+    # Checkpoint-frame buffer: maps step -> first camera image (HWC uint8/float).
+    # Capped at 400 frames to bound memory usage.
+    _ck_img_buffer: dict[int, np.ndarray] = {}
+    _prev_best_slot_t: int = -1
+    # Track which failure_detection/* scalar keys have been logged so we can
+    # log NaN for them during a recovery rewind.
+    _logged_fd_keys: set[str] = set()
+
     while not np.all(done) and step < max_steps:
         observation = preprocess_observation(observation)
         observation = add_envs_task(env, observation)
@@ -227,6 +237,13 @@ def rollout(
             obs0_rerun: dict[str, np.ndarray] = {
                 k: v[0].cpu().numpy() for k, v in observation.items() if isinstance(v, torch.Tensor)
             }
+            # Buffer first camera image for checkpoint-frame display.
+            for _ck_v in obs0_rerun.values():
+                if isinstance(_ck_v, np.ndarray) and _ck_v.ndim == 3:
+                    _ck_img_buffer[step] = _ck_v
+                    if len(_ck_img_buffer) > 400:
+                        del _ck_img_buffer[min(_ck_img_buffer)]
+                    break
 
         # Buffer per-env observations for incremental dataset saving.
         if dataset is not None:
@@ -268,6 +285,15 @@ def rollout(
         if _fp is not None and _fp.recovery_pending_wait:
             _fp.recovery_pending_wait = False
             logging.info(f"[SimEval] step {step}: failure recovery triggered — clearing wait flag")
+            # Rerun: erase the invalid portion of the curves by logging NaN for every
+            # step after the checkpoint up to (but not including) the current step.
+            if display_data and _logged_fd_keys:
+                _best_t = _fp.strategy.best_slot_timestep
+                if _best_t >= 0:
+                    for _gs in range(rr_step_offset + _best_t + 1, rr_step_offset + step):
+                        rr.set_time("step", sequence=_gs)
+                        for _k in _logged_fd_keys:
+                            rr.log(_k, rr.Scalars(float("nan")))
             if _fp.config.enable_logging:
                 _fp.log_recovery_frame()
                 if _fp.config.flush_metrics_every_step:
@@ -300,7 +326,7 @@ def rollout(
 
         # Rerun: log env-0 observation, action, and failure-detection metrics.
         if display_data:
-            rr.set_time("step", sequence=step)
+            rr.set_time("step", sequence=rr_step_offset + step)
             action0 = {f"dim_{i}": float(v) for i, v in enumerate(action_numpy[0])}
             log_rerun_data(
                 observation=obs0_rerun,
@@ -308,19 +334,85 @@ def rollout(
                 compress_images=display_compressed_images,
             )
             if _fp is not None:
-                # Log detector state directly — always Python floats, updated every step.
-                rr.log("failure_detection/td_raw", rr.Scalars(_fp.detector.td_raw))
-                rr.log("failure_detection/td_smoothed", rr.Scalars(_fp.detector.td_smoothed))
-                rr.log("failure_detection/is_failing", rr.Scalars(float(_fp.detector.is_failing())))
-                # Log any extra numeric fields from last_row (strategy / plugin metrics).
-                # Use float() conversion to handle both Python and numpy scalar types.
+                if step == 0:
+                    # Build image views dynamically from the actual observation keys.
+                    _img_views = []
+                    for _k, _v in obs0_rerun.items():
+                        if isinstance(_v, np.ndarray) and _v.ndim == 3:
+                            _entity = _k if _k.startswith(OBS_PREFIX) else f"{OBS_STR}.{_k}"
+                            _img_views.append(rrb.Spatial2DView(name=_entity.split(".")[-1], origin=_entity))
+                    _img_views.append(
+                        rrb.Spatial2DView(
+                            name="checkpoint_frame", origin="failure_detection/checkpoint_frame"
+                        )
+                    )
+                    rr.send_blueprint(
+                        rrb.Blueprint(
+                            rrb.Horizontal(
+                                rrb.Grid(*_img_views, grid_columns=2),
+                                rrb.Tabs(
+                                    rrb.TimeSeriesView(name="TD", origin="failure_detection/td"),
+                                    rrb.TimeSeriesView(
+                                        name="Checkpoint Step", origin="failure_detection/checkpoint_step"
+                                    ),
+                                    rrb.TimeSeriesView(
+                                        name="Attention Entropy", origin="failure_detection/attention_entropy"
+                                    ),
+                                    rrb.TimeSeriesView(
+                                        name="Similarity", origin="failure_detection/similarity"
+                                    ),
+                                ),
+                            ),
+                            auto_views=False,
+                        )
+                    )
+                # Log detector state — entity paths under failure_detection/td/.
+                rr.log("failure_detection/td/td_raw", rr.Scalars(_fp.detector.td_raw))
+                rr.log("failure_detection/td/td_smoothed", rr.Scalars(_fp.detector.td_smoothed))
+                rr.log("failure_detection/td/is_failing", rr.Scalars(float(_fp.detector.is_failing())))
+                rr.log(
+                    "failure_detection/td/td_threshold", rr.Scalars(_fp.detector._config.failure_threshold)
+                )
+                _logged_fd_keys.update(
+                    {
+                        "failure_detection/td/td_raw",
+                        "failure_detection/td/td_smoothed",
+                        "failure_detection/td/is_failing",
+                        "failure_detection/td/td_threshold",
+                    }
+                )
+                # Log extra numeric fields from last_row, routed by key:
+                #   attention_entropy → failure_detection/attention_entropy/
+                #   *_similarity     → failure_detection/similarity/
+                #   everything else  → failure_detection/td/
                 if _fp.recorder.last_row is not None:
                     skip = {"td_raw", "td_smoothed", "episode", "global_step", "timestamp"}
                     for k, v in _fp.recorder.last_row.items():
                         if k in skip:
                             continue
                         with contextlib.suppress(TypeError, ValueError):
-                            rr.log(f"failure_detection/{k}", rr.Scalars(float(v)))
+                            if k == "attention_entropy":
+                                path = f"failure_detection/attention_entropy/{k}"
+                            elif k.endswith("_similarity"):
+                                path = f"failure_detection/similarity/{k}"
+                            elif k == "best_slot_timestep":
+                                path = f"failure_detection/checkpoint_step/{k}"
+                            else:
+                                path = f"failure_detection/td/{k}"
+                            rr.log(path, rr.Scalars(float(v)))
+                            _logged_fd_keys.add(path)
+                # Log checkpoint frame whenever the best slot changes.
+                _best_t = _fp.strategy.best_slot_timestep
+                if _best_t != _prev_best_slot_t and _best_t >= 0 and _best_t in _ck_img_buffer:
+                    _ck_arr = _ck_img_buffer[_best_t]
+                    if (
+                        _ck_arr.ndim == 3
+                        and _ck_arr.shape[0] in (1, 3, 4)
+                        and _ck_arr.shape[-1] not in (1, 3, 4)
+                    ):
+                        _ck_arr = np.transpose(_ck_arr, (1, 2, 0))
+                    rr.log("failure_detection/checkpoint_frame", rr.Image(_ck_arr))
+                    _prev_best_slot_t = _best_t
 
         observation, reward, terminated, truncated, info = env.step(action_numpy)
         if render_callback is not None:
@@ -496,6 +588,7 @@ def eval_policy(
     if max_episodes_rendered > 0:
         video_paths: list[str] = []
 
+    _rr_step_offset: int = 0
     progbar = trange(n_batches, desc="Stepping through eval batches", disable=inside_slurm())
     for batch_ix in progbar:
         if max_episodes_rendered > 0:
@@ -531,6 +624,7 @@ def eval_policy(
                 dataset=dataset,
                 dataset_task=dataset_task,
                 save_only_success=save_only_success,
+                rr_step_offset=_rr_step_offset,
             )
 
             if events is not None and events.get("rerecord_episode"):
@@ -540,6 +634,9 @@ def eval_policy(
                 logging.info(f"[SimEval] batch {batch_ix}: rerecord requested — retrying with same seeds")
                 continue
             break
+
+        # Advance the rerun global step offset so the next batch's curves don't overlap.
+        _rr_step_offset += rollout_data["done"].shape[1]
 
         if events is not None and events.get("stop_recording"):
             logging.info("[SimEval] Stop requested — ending evaluation early.")

@@ -36,6 +36,13 @@ ACTION_LOW = -1.0
 ACTION_HIGH = 1.0
 
 
+def _flatten_gripper_idx(idx) -> np.ndarray:
+    """Flatten gripper joint indexes regardless of whether they are a list, array, or dict of lists."""
+    if isinstance(idx, dict):
+        idx = [i for v in idx.values() for i in (v if hasattr(v, "__iter__") else [v])]
+    return np.array(idx, dtype=int).flatten()
+
+
 def convert_state(dict_state):
     """
     Converts input state (dict) to format expected LeRobot (np.array)
@@ -245,20 +252,20 @@ class RoboCasaEnv(RoboCasaGymEnv):
         sim = self.unwrapped.sim
         robot = self.unwrapped.robots[0]
         return {
-            "arm_qpos": sim.data.qpos[robot._ref_joint_pos_indexes].copy(),
-            "arm_qvel": sim.data.qvel[robot._ref_joint_vel_indexes].copy(),
-            "gripper_qpos": sim.data.qpos[robot._ref_gripper_joint_pos_indexes].copy(),
-            "gripper_qvel": sim.data.qvel[robot._ref_gripper_joint_vel_indexes].copy(),
+            "arm_qpos": sim.data.qpos[np.array(robot._ref_joint_pos_indexes, dtype=int)].copy(),
+            "arm_qvel": sim.data.qvel[np.array(robot._ref_joint_vel_indexes, dtype=int)].copy(),
+            "gripper_qpos": sim.data.qpos[_flatten_gripper_idx(robot._ref_gripper_joint_pos_indexes)].copy(),
+            "gripper_qvel": sim.data.qvel[_flatten_gripper_idx(robot._ref_gripper_joint_vel_indexes)].copy(),
         }
 
     def set_abs_state(self, state: dict) -> None:
         """Restore robot joint state from a failure recovery checkpoint."""
         sim = self.unwrapped.sim
         robot = self.unwrapped.robots[0]
-        sim.data.qpos[robot._ref_joint_pos_indexes] = state["arm_qpos"]
-        sim.data.qvel[robot._ref_joint_vel_indexes] = state["arm_qvel"]
-        sim.data.qpos[robot._ref_gripper_joint_pos_indexes] = state["gripper_qpos"]
-        sim.data.qvel[robot._ref_gripper_joint_vel_indexes] = state["gripper_qvel"]
+        sim.data.qpos[np.array(robot._ref_joint_pos_indexes, dtype=int)] = state["arm_qpos"]
+        sim.data.qvel[np.array(robot._ref_joint_vel_indexes, dtype=int)] = state["arm_qvel"]
+        sim.data.qpos[_flatten_gripper_idx(robot._ref_gripper_joint_pos_indexes)] = state["gripper_qpos"]
+        sim.data.qvel[_flatten_gripper_idx(robot._ref_gripper_joint_vel_indexes)] = state["gripper_qvel"]
         sim.forward()
 
 
