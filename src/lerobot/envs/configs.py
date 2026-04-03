@@ -468,6 +468,8 @@ class RoboCasaEnv(EnvConfig):
     observation_width: int = 256
     split: str | None = None  # Optional Robocasa dataset split {None, "all", "pretrain", "target"}
     episode_length: int | None = None  # Override task horizon (None = use registry default)
+    layout_ids: list[int] | None = None  # Fix kitchen layout(s) to evaluate on (0-9); None = random
+    style_ids: list[int] | None = None  # Fix kitchen style(s) to evaluate on (0-10); None = random
     features: dict[str, PolicyFeature] = field(
         default_factory=lambda: {
             ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(12,)),
@@ -508,7 +510,7 @@ class RoboCasaEnv(EnvConfig):
 
     @property
     def gym_kwargs(self) -> dict:
-        return {
+        kwargs: dict[str, Any] = {
             "obs_type": self.obs_type,
             "render_mode": self.render_mode,
             "observation_width": self.observation_width,
@@ -517,3 +519,8 @@ class RoboCasaEnv(EnvConfig):
             "split": self.split,
             "episode_length": self.episode_length,
         }
+        if self.layout_ids is not None:
+            kwargs["layout_ids"] = [int(x) for x in self.layout_ids]
+        if self.style_ids is not None:
+            kwargs["style_ids"] = [int(x) for x in self.style_ids]
+        return kwargs
