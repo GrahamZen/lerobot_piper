@@ -34,6 +34,7 @@ from torchvision.models._utils import IntermediateLayerGetter
 from torchvision.ops.misc import FrozenBatchNorm2d
 
 from lerobot.policies.act.configuration_act import ACTConfig
+from lerobot.policies.failure_postprocessor import FailurePostprocessor  # noqa: F401
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 
@@ -66,7 +67,34 @@ class ACTPolicy(PreTrainedPolicy):
         if config.temporal_ensemble_coeff is not None:
             self.temporal_ensembler = ACTTemporalEnsembler(config.temporal_ensemble_coeff, config.chunk_size)
 
+        self._failure_postprocessor = None
+
         self.reset()
+
+    def init_failure_postprocessor(
+        self,
+        output_dir=None,
+        failure_handling_json_path=None,
+    ):
+        """Initialize failure detection monitoring.
+
+        Call this after policy construction to enable real-time failure metric
+        computation and logging during inference.
+
+        Args:
+            output_dir: Directory to write failure_metrics.jsonl (typically dataset.root).
+            failure_handling_json_path: Path to failure_handling.json for runtime
+                failure handling parameters.
+        """
+        self._failure_postprocessor = FailurePostprocessor(
+            policy=self,
+            output_dir=output_dir,
+            failure_handling_json_path=failure_handling_json_path,
+        )
+
+    def finalize(self):
+        if self._failure_postprocessor is not None:
+            self._failure_postprocessor.finalize()
 
     def get_optim_params(self) -> dict:
         # TODO(aliberts, rcadene): As of now, lr_backbone == lr
@@ -95,6 +123,8 @@ class ACTPolicy(PreTrainedPolicy):
             self.temporal_ensembler.reset()
         else:
             self._action_queue = deque([], maxlen=self.config.n_action_steps)
+        if self._failure_postprocessor is not None:
+            self._failure_postprocessor.reset()
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
@@ -106,20 +136,31 @@ class ACTPolicy(PreTrainedPolicy):
         """
         self.eval()  # keeping the policy in eval mode as it could be set to train mode while queue is consumed
 
+        new_actions_chunk = None
+
         if self.config.temporal_ensemble_coeff is not None:
-            actions = self.predict_action_chunk(batch)
-            action = self.temporal_ensembler.update(actions)
-            return action
+            new_actions_chunk = self.predict_action_chunk(batch)
+            intended_action = self.temporal_ensembler.update(new_actions_chunk)
+        else:
+            # Action queue logic for n_action_steps > 1. When the action_queue is depleted, populate it by
+            # querying the policy.
+            if len(self._action_queue) == 0:
+                new_actions_chunk = self.predict_action_chunk(batch)[:, : self.config.n_action_steps]
 
-        # Action queue logic for n_action_steps > 1. When the action_queue is depleted, populate it by
-        # querying the policy.
-        if len(self._action_queue) == 0:
-            actions = self.predict_action_chunk(batch)[:, : self.config.n_action_steps]
+                # `self.model.forward` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue
+                # effectively has shape (n_action_steps, batch_size, *), hence the transpose.
+                self._action_queue.extend(new_actions_chunk.transpose(0, 1))
 
-            # `self.model.forward` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue
-            # effectively has shape (n_action_steps, batch_size, *), hence the transpose.
-            self._action_queue.extend(actions.transpose(0, 1))
-        return self._action_queue.popleft()
+            intended_action = self._action_queue.popleft()
+
+        if self._failure_postprocessor is not None:
+            return self._failure_postprocessor.process(
+                batch=batch,
+                intended_action=intended_action,
+                new_actions_chunk=new_actions_chunk,
+            )
+
+        return intended_action
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
