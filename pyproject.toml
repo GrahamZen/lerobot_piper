@@ -43,7 +43,7 @@ version = "0.4.4"
 description = "🤗 LeRobot: State-of-the-art Machine Learning for Real-World Robotics in Pytorch"
 dynamic = ["readme"]
 license = { text = "Apache-2.0" }
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.11"
 authors = [
     { name = "Rémi Cadène", email = "re.cadene@gmail.com" },
     { name = "Simon Alibert", email = "alibert.sim@gmail.com" },
@@ -74,13 +74,13 @@ dependencies = [
     "pyrealsense2",
     "matplotlib",
     "pre-commit",
-
     # Hugging Face dependencies
     "datasets>=4.0.0,<4.2.0",
     "diffusers>=0.27.2,<0.36.0",
     "huggingface-hub[hf-transfer,cli]>=0.34.2,<0.36.0",
     "accelerate>=1.10.0,<2.0.0",
     # Core dependencies
+    "numpy==2.2.5",  # robocasa requires exactly 2.2.5
     "setuptools>=71.0.0,<81.0.0",
     "cmake>=3.29.0.1,<4.2.0",
     "einops>=0.8.0,<0.9.0",
@@ -114,7 +114,7 @@ dependencies = [
     "termcolor>=2.4.0,<4.0.0",
     "piper_sdk",
     "rich",
-    "mujoco>=3.4.0",
+    "mujoco==3.3.1",
     "tqdm>=4.67.2",
     "hdbscan>=0.8.41",
     "ipywidgets>=8.1.8",
@@ -182,6 +182,7 @@ aloha = ["gym-aloha>=0.1.2,<0.2.0"]
 pusht = ["gym-pusht>=0.1.5,<0.2.0", "pymunk>=6.6.0,<7.0.0"] # TODO: Fix pymunk version in gym-pusht instead
 libero = ["lerobot[transformers-dep]", "hf-libero>=0.1.3,<0.2.0"]
 metaworld = ["metaworld==3.0.0"]
+robocasa = ["robocasa @ git+https://github.com/brunomachado37/robocasa.git@lerobocasa", "robosuite @ git+https://github.com/ARISE-Initiative/robosuite"]
 
 # All
 all = [
@@ -192,7 +193,6 @@ all = [
     "lerobot[reachy2]",
     "lerobot[kinematics]",
     "lerobot[intelrealsense]",
-    "lerobot[pi]",
     "lerobot[smolvla]",
     # "lerobot[groot]", TODO(Steven): Gr00t requires specific installation instructions for flash-attn
     "lerobot[hilserl]",
@@ -491,4 +491,15 @@ conflicts = [
         { extra = "pi" },
         { extra = "all" },
     ],
+    # robocasa requires tianshou==0.4.10 which needs protobuf<3.20,
+    # incompatible with anything that pulls in protobuf>=4.x
+    [{ extra = "robocasa" }, { extra = "async" }],
+    [{ extra = "robocasa" }, { extra = "grpcio-dep" }],
+    [{ extra = "robocasa" }, { extra = "hilserl" }],
+    [{ extra = "robocasa" }, { extra = "dev" }],
+    [{ extra = "robocasa" }, { extra = "genai" }],
+    [{ extra = "robocasa" }, { extra = "reachy2" }],
+    [{ extra = "robocasa" }, { extra = "all" }],
+    [{ extra = "robocasa" }, { extra = "pi" }],
+    [{ extra = "robocasa" }, { extra = "libero" }],
 ]

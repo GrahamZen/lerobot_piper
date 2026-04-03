@@ -405,6 +405,10 @@ def rollout(
             _fp.perturbation.reset()
             _fp._step = 0
         else:
+            if save_only_success:
+                ep_success = torch.stack(all_successes, dim=1).any(dim=1).tolist()
+                if not any(ep_success):
+                    _fp.discard_current_episode()
             _fp.reset()
 
     ret = {
