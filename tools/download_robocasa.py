@@ -183,7 +183,7 @@ def _convert_to_v30(raw_path: Path, repo_id: str) -> Path:
 
 def _ensure_cache_link(v3_path: Path, split: str, task_name: str) -> str:
     """Symlink the v3.0 dataset into the local HF cache. Returns the repo_id."""
-    lerobot_cache = Path("/mnt/Data/gehan/.cache/huggingface/lerobot/local/robocasa")
+    lerobot_cache = Path("/home/droplab/.cache/huggingface/lerobot/local/robocasa")
     lerobot_cache.mkdir(parents=True, exist_ok=True)
     cache_name = f"{split}_{task_name}"
     cache_link = lerobot_cache / cache_name
@@ -308,7 +308,7 @@ def mode_filter(
             suffix_parts.append("style" + "_".join(str(i) for i in sorted(style_ids)))
         out_repo_id = f"local/robocasa/{split}_{task_name}_{'_'.join(suffix_parts)}"
 
-    output_root = Path("/mnt/Data/gehan/.cache/huggingface/lerobot/local/robocasa")
+    output_root = Path("/home/droplab/.cache/huggingface/lerobot/loca/robocasa")
     split_key = out_repo_id.split("/")[-1]
     save_path = output_root / split_key
 
