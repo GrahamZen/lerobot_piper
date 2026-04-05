@@ -183,7 +183,7 @@ def _convert_to_v30(raw_path: Path, repo_id: str) -> Path:
 
 def _ensure_cache_link(v3_path: Path, split: str, task_name: str) -> str:
     """Symlink the v3.0 dataset into the local HF cache. Returns the repo_id."""
-    lerobot_cache = Path("/home/droplab/.cache/huggingface/lerobot/local/robocasa")
+    lerobot_cache = Path("~/.cache/huggingface/lerobot/local/robocasa").expanduser()
     lerobot_cache.mkdir(parents=True, exist_ok=True)
     cache_name = f"{split}_{task_name}"
     cache_link = lerobot_cache / cache_name
@@ -308,13 +308,14 @@ def mode_filter(
             suffix_parts.append("style" + "_".join(str(i) for i in sorted(style_ids)))
         out_repo_id = f"local/robocasa/{split}_{task_name}_{'_'.join(suffix_parts)}"
 
-    output_root = Path("/home/droplab/.cache/huggingface/lerobot/loca/robocasa")
+    output_root = Path("~/.cache/huggingface/lerobot/local/robocasa").expanduser()
     split_key = out_repo_id.split("/")[-1]
     save_path = output_root / split_key
 
     if save_path.exists() and any(save_path.iterdir()):
         print(f"Filtered dataset already exists at {save_path}")
         print(f"Output dataset: {out_repo_id}")
+        _print_train_cmd(task_name, split, out_repo_id)
         return
 
     # Download raw
@@ -394,8 +395,20 @@ def mode_filter(
     _print_train_cmd(task_name, split, out_repo_id)
 
 
+def _camel_to_words(name: str) -> str:
+    """Convert CamelCase to space-separated lowercase words (first word capitalised)."""
+    import re
+
+    words = re.sub(r"([A-Z])", r" \1", name).split()
+    if not words:
+        return name
+    return words[0] + (" " + " ".join(w.lower() for w in words[1:]) if len(words) > 1 else "")
+
+
 def _print_train_cmd(task_name: str, split: str, repo_id: str) -> None:
     job_name = repo_id.split("/")[-1]
+    single_task = _camel_to_words(task_name)
+    eval_repo_id = f"eval/robocasa_{job_name}_1"
     print(f"""
 Training command:
 
@@ -415,7 +428,23 @@ uv run --extra robocasa lerobot-train \\
   --num_workers=24 \\
   --policy.optimizer_lr=1e-4 \\
   --steps=200000 \\
-  --save_freq=25000""")
+  --save_freq=25000
+
+Eval command:
+
+uv run lerobot-sim-eval \\
+  --policy.path=outputs/train/{job_name}/checkpoints/last/pretrained_model \\
+  --env.type=robocasa \\
+  --env.task={task_name} \\
+  --eval.batch_size=1 \\
+  --eval.n_episodes=10 \\
+  --policy.use_amp=false \\
+  --policy.device=cuda \\
+  --dataset.repo_id={eval_repo_id} \\
+  --dataset.single_task="{single_task}" \\
+  --display_data=true \\
+  --policy.n_action_steps=1 \\
+  --policy.temporal_ensemble_coeff=0.01""")
 
 
 # ---------------------------------------------------------------------------
