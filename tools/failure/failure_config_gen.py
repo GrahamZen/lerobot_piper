@@ -141,35 +141,44 @@ def compute_checkpoint_features(
     verified_cp_ts_by_ep: dict[int, list[int]],
     pretrained_path: Path,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Compute ACT encoder_out features for all VLM-verified checkpoints.
+    """Compute encoder_out features for all VLM-verified checkpoints.
 
-    Hooks ``model.encoder`` output (seq_len, B, d), skips the latent token at
-    index 0, and mean-pools the remaining tokens → 512-dim feature per step.
+    Hooks ``model.encoder`` output (seq_len, B, d) and mean-pools all
+    observation tokens → feature per step.  Works for any policy that
+    exposes ``model.encoder`` (ACT, ACT-FM, …).
+
+    ACT prepends a latent token at index 0 (zeros at inference); ACT-FM has
+    no latent token.  We detect this via ``config.use_vae`` so no tokens are
+    accidentally dropped.
 
     Each episode contributes n checkpoint timestamps (sorted). Features are
     grouped by checkpoint index and averaged across episodes, yielding a
-    (n_slots, 512) matrix.
+    (n_slots, d) matrix.
 
     Returns:
         mean_feat_matrix:   (n_slots, d) mean feature per slot.
         ep_feat_matrix:     (n_ep, n_slots, d) per-episode per-slot features.
         all_feat_vectors:   (N, d) all individual vectors, L2-normalised.
     """
-    from lerobot.policies.act.modeling_act import ACTPolicy
-    from lerobot.policies.factory import make_pre_post_processors
+    from lerobot.configs.policies import PreTrainedConfig
+    from lerobot.policies.factory import get_policy_class, make_pre_post_processors
 
     print(f"\n[EncoderOut] Loading policy from {pretrained_path}...")
-    policy = ACTPolicy.from_pretrained(str(pretrained_path))
+    cfg = PreTrainedConfig.from_pretrained(str(pretrained_path))
+    policy = get_policy_class(cfg.type).from_pretrained(str(pretrained_path))
     policy.eval()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     policy.to(device)
     preprocessor, _ = make_pre_post_processors(policy.config, pretrained_path=str(pretrained_path))
 
+    has_latent = bool(getattr(policy.config, "use_vae", False))
+
     enc_buf: list[torch.Tensor] = []  # (B, d) per forward pass
 
     def _enc_hook(_module, _input, output):
-        # output: (seq_len, B, d) — index 0 is the latent token (zeros at inference)
-        enc_buf.append(output[1:].mean(dim=0).detach())  # (B, d)
+        # Skip the latent token at index 0 for ACT (use_vae=True); ACT-FM has none.
+        obs_tokens = output[1:] if has_latent else output
+        enc_buf.append(obs_tokens.mean(dim=0).detach())  # (B, d)
 
     h = policy.model.encoder.register_forward_hook(_enc_hook)
 
@@ -272,11 +281,12 @@ def compute_backbone_features(
     """
     import torch.nn.functional as F  # noqa: N812
 
-    from lerobot.policies.act.modeling_act import ACTPolicy
-    from lerobot.policies.factory import make_pre_post_processors
+    from lerobot.configs.policies import PreTrainedConfig
+    from lerobot.policies.factory import get_policy_class, make_pre_post_processors
 
     print(f"\n[Backbone] Loading policy from {pretrained_path}...")
-    policy = ACTPolicy.from_pretrained(str(pretrained_path))
+    cfg = PreTrainedConfig.from_pretrained(str(pretrained_path))
+    policy = get_policy_class(cfg.type).from_pretrained(str(pretrained_path))
     policy.eval()
     backbone = policy.model.backbone
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

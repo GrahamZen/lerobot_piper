@@ -185,9 +185,12 @@ def _pool_backbone_feats(feat_buffer: list) -> "Tensor | None":
 def _attach_encoder_out_hook(strategy: "BaseCheckpointStrategy", policy, label: str) -> None:
     """Register a forward hook on ``model.encoder``.
 
-    Captures the encoder output (seq_len, B, D), skips the latent token at
-    index 0, and mean-pools the remaining tokens → (B, D) stored in
-    ``strategy._feat_buffer``.
+    Captures the encoder output (seq_len, B, D) and mean-pools all observation
+    tokens → (B, D) stored in ``strategy._feat_buffer``.
+
+    ACT prepends a latent token at index 0 (zeros at inference time); ACT-FM
+    has no latent token.  We detect this via ``config.use_vae`` and skip
+    index 0 only when a latent is present.
     """
     model = getattr(policy, "model", None)
     encoder = getattr(model, "encoder", None) if model else None
@@ -195,9 +198,13 @@ def _attach_encoder_out_hook(strategy: "BaseCheckpointStrategy", policy, label: 
         logger.warning("%s: policy has no model.encoder — hook not registered", label)
         return
 
+    has_latent = bool(getattr(getattr(policy, "config", None), "use_vae", False))
+
     def _hook(_module, _input, output):
-        # output: (seq_len, B, D) — index 0 is the latent token (zeros at inference)
-        strategy._feat_buffer.append(output[1:].mean(dim=0).detach())  # (B, D)
+        # output: (seq_len, B, D)
+        # Skip index 0 only for ACT (latent token); ACT-FM starts at 0.
+        obs_tokens = output[1:] if has_latent else output
+        strategy._feat_buffer.append(obs_tokens.mean(dim=0).detach())  # (B, D)
 
     strategy._hooks.append(encoder.register_forward_hook(_hook))
 
