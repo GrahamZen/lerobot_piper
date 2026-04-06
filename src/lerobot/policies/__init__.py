@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from .act.configuration_act import ACTConfig as ACTConfig
+from .act.configuration_act_fm import ACTFMConfig as ACTFMConfig
 from .diffusion.configuration_diffusion import DiffusionConfig as DiffusionConfig
 from .groot.configuration_groot import GrootConfig as GrootConfig
 from .pi0.configuration_pi0 import PI0Config as PI0Config
@@ -27,6 +28,7 @@ from .xvla.configuration_xvla import XVLAConfig as XVLAConfig
 
 __all__ = [
     "ACTConfig",
+    "ACTFMConfig",
     "DiffusionConfig",
     "PI0Config",
     "PI05Config",

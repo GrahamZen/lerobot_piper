@@ -87,6 +87,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from lerobot.policies.act.modeling_act import ACTPolicy
 
         return ACTPolicy
+    elif name == "act_fm":
+        from lerobot.policies.act.modeling_act_fm import ACTFMPolicy
+
+        return ACTFMPolicy
     elif name == "vqbet":
         from lerobot.policies.vqbet.modeling_vqbet import VQBeTPolicy
 
