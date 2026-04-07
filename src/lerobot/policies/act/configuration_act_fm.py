@@ -117,6 +117,21 @@ class ACTFMConfig(PreTrainedConfig):
     min_period: float = 4e-3
     max_period: float = 4.0
 
+    # Inference time-step schedule.
+    # "linear"    — uniform steps: t = 1, (N-1)/N, ..., 1/N, 0  (default)
+    # "quadratic" — denser steps near t=0: t_i = (1 - i/N)²
+    #               More evaluations where the velocity field is sharpest.
+    time_schedule: str = "linear"
+
+    # Training: minibatch Optimal Transport noise-action coupling.
+    # False — standard CFM: noise[i] pairs with action[i] in the same batch.
+    # True  — OT-CFM: solve linear assignment within each minibatch to find
+    #          the minimum-cost noise↔action pairing (Hungarian algorithm).
+    #          Reduces flow-line crossings, simplifying the learned velocity
+    #          field. Requires scipy (pip install scipy). Negligible overhead
+    #          for batch sizes ≤ 256.
+    use_ot_matching: bool = False
+
     # Optimiser presets.
     optimizer_lr: float = 1e-5
     optimizer_weight_decay: float = 1e-4
@@ -139,6 +154,8 @@ class ACTFMConfig(PreTrainedConfig):
             raise ValueError(
                 f"Multiple observation steps not supported yet. Got n_obs_steps={self.n_obs_steps}."
             )
+        if self.time_schedule not in ("linear", "quadratic"):
+            raise ValueError(f"`time_schedule` must be 'linear' or 'quadratic'. Got {self.time_schedule!r}.")
 
     def get_optimizer_preset(self) -> AdamWConfig:
         return AdamWConfig(

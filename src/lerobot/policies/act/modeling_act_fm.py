@@ -86,6 +86,38 @@ def create_sinusoidal_pos_embedding(
     return torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=1).float()
 
 
+def ot_matching(noise: Tensor, actions: Tensor) -> Tensor:
+    """Minibatch Optimal Transport: re-order noise within the batch.
+
+    Solves a linear assignment problem to find the permutation of noise
+    samples that minimises total L2 transport cost to the action samples.
+    This ensures flow lines within each minibatch do not cross, making the
+    learned velocity field single-valued and easier to fit.
+
+    Uses scipy's Hungarian algorithm (O(B³), negligible for B ≤ 256).
+
+    Args:
+        noise:   (B, S, A)
+        actions: (B, S, A)
+    Returns:
+        (B, S, A) re-ordered noise (same samples, different assignment).
+    """
+    try:
+        from scipy.optimize import linear_sum_assignment
+    except ImportError as e:
+        raise ImportError("use_ot_matching requires scipy. Install it with: pip install scipy") from e
+
+    batch_size = noise.shape[0]
+    # Flatten to (B, S*A) and compute pairwise L2 cost matrix on CPU.
+    n_flat = noise.reshape(batch_size, -1).float().cpu()
+    a_flat = actions.reshape(batch_size, -1).float().cpu()
+    # cdist: (B, B) where cost[i, j] = ||noise[i] - actions[j]||
+    cost = torch.cdist(n_flat, a_flat).numpy()
+    # Hungarian algorithm: find permutation perm s.t. noise[perm[j]] → actions[j]
+    _, col_ind = linear_sum_assignment(cost)
+    return noise[col_ind]
+
+
 def sample_beta(alpha: float, beta: float, bsize: int, device) -> Tensor:
     """Exact copy of pi05 `sample_beta` (CPU sampling for MPS compatibility)."""
     alpha_t = torch.tensor(alpha, dtype=torch.float32)
@@ -445,6 +477,8 @@ class ACTFlowMatching(nn.Module):
         encoder_out, encoder_pos_embed = self._encode_observations(batch)
 
         noise = self.sample_noise(actions.shape, device).to(dtype=actions.dtype)
+        if self.config.use_ot_matching:
+            noise = ot_matching(noise, actions).to(device=device, dtype=actions.dtype)
         t = self.sample_time(batch_size, device).to(dtype=actions.dtype)
 
         t_bc = t[:, None, None]
@@ -485,32 +519,43 @@ class ACTFlowMatching(nn.Module):
 
         action_dim = self.config.action_feature.shape[0]
         num_steps = self.config.num_inference_steps
-        dt = -1.0 / num_steps
+
+        # Build time sequence t=1→0 according to the configured schedule.
+        if self.config.time_schedule == "quadratic":
+            # t_i = (1 - i/N)²  — dense steps near t=0, coarse near t=1.
+            # e.g. N=5: [1.00, 0.64, 0.36, 0.16, 0.04, 0.00]
+            steps = torch.linspace(0.0, 1.0, num_steps + 1, device=device, dtype=dtype)
+            t_seq = (1.0 - steps) ** 2
+        else:
+            # "linear": uniform steps [1.0, (N-1)/N, ..., 1/N, 0.0]
+            t_seq = torch.linspace(1.0, 0.0, num_steps + 1, device=device, dtype=dtype)
 
         # Start from pure noise at t=1 (pi05 line 823).
         x_t = self.sample_noise((batch_size, self.config.chunk_size, action_dim), device).to(dtype=dtype)
 
         for step in range(num_steps):
-            t_val = 1.0 + step * dt  # 1.0, (N-1)/N, ..., 1/N
+            t_val = t_seq[step].item()
+            t_next_val = t_seq[step + 1].item()
+            dt = t_next_val - t_val  # negative (moving toward 0)
+
             t_cur = torch.full((batch_size,), t_val, device=device, dtype=dtype)
 
-            # First evaluation: velocity at current point (same as Euler).
+            # First evaluation: velocity at current point.
             v1 = self._decode_velocity(x_t, t_cur, encoder_out, encoder_pos_embed)
 
-            # Euler predictor: x at next time step.
+            # Euler predictor to next time point.
             x_euler = x_t + dt * v1
 
-            # Last step: Euler result is fine (nothing to correct against).
+            # Last step: use Euler result directly.
             if step == num_steps - 1:
                 x_t = x_euler
                 break
 
             # Second evaluation: velocity at Euler-predicted next point.
-            t_next_val = t_val + dt  # one step further toward 0
             t_next = torch.full((batch_size,), t_next_val, device=device, dtype=dtype)
             v2 = self._decode_velocity(x_euler, t_next, encoder_out, encoder_pos_embed)
 
-            # Corrector: average velocity → final step.
+            # Heun corrector: step with average velocity.
             x_t = x_t + dt * (v1 + v2) / 2.0
 
         return x_t  # (B, chunk_size, action_dim)
