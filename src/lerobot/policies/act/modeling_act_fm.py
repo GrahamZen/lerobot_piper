@@ -543,13 +543,17 @@ class ACTFlowMatching(nn.Module):
             # First evaluation: velocity at current point.
             v1 = self._decode_velocity(x_t, t_cur, encoder_out, encoder_pos_embed)
 
-            # Euler predictor to next time point.
-            x_euler = x_t + dt * v1
-
-            # Last step: use Euler result directly.
+            # Last step: readout trick or plain Euler.
             if step == num_steps - 1:
-                x_t = x_euler
+                # Direct projection (readout trick): action = x_t - t * v_pred.
+                # Derivation: x_t = t*noise + (1-t)*action
+                #   -> action = x_t - t*(noise-action) = x_t - t*u_t ≈ x_t - t*v_pred
+                # Bypasses the O(dt) Euler truncation error at the endpoint.
+                x_t = x_t - t_val * v1 if self.config.use_readout_trick else x_t + dt * v1
                 break
+
+            # Euler predictor to next time point (intermediate steps only).
+            x_euler = x_t + dt * v1
 
             # Second evaluation: velocity at Euler-predicted next point.
             t_next = torch.full((batch_size,), t_next_val, device=device, dtype=dtype)

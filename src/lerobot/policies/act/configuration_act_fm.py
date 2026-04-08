@@ -123,6 +123,14 @@ class ACTFMConfig(PreTrainedConfig):
     #               More evaluations where the velocity field is sharpest.
     time_schedule: str = "linear"
 
+    # Terminal readout trick: replaces the last ODE step with a direct
+    # projection  action = x_t - t * v_pred, derived from the flow identity:
+    #   x_t = t*noise + (1-t)*action  →  action = x_t - t*(noise-action) = x_t - t*u_t
+    # Eliminates the O(dt) truncation error at the endpoint.
+    # Most effective combined with time_schedule="quadratic" (smaller last t).
+    # Default: True — recommended on real hardware to reduce endpoint jitter.
+    use_readout_trick: bool = True
+
     # Training: minibatch Optimal Transport noise-action coupling.
     # False — standard CFM: noise[i] pairs with action[i] in the same batch.
     # True  — OT-CFM: solve linear assignment within each minibatch to find
