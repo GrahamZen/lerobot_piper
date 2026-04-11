@@ -141,6 +141,109 @@ def sample_action_chunks(policy, batch: dict[str, Tensor]) -> Tensor:
 
 
 # ---------------------------------------------------------------------------
+# RND training
+# ---------------------------------------------------------------------------
+
+
+def _train_rnd_checkpoint(
+    calibration_repo_id: str,
+    calibration_root: str | None,
+    policy,
+    extractor,
+    device: torch.device,
+    output_path: Path,
+    hidden_dim: int = 1024,
+    out_dim: int = 512,
+    n_epochs: int = 50,
+    batch_size_train: int = 256,
+    lr: float = 1e-4,
+) -> None:
+    """Collect encoder embeddings from the calibration dataset and train a RND checkpoint.
+
+    Reuses the already-loaded *policy* and *extractor* so no second model load
+    is needed.  The trained checkpoint is saved to *output_path*.
+    """
+    import torch.nn as nn
+    import torch.optim as optim
+    from torch.utils.data import DataLoader, TensorDataset
+    from tqdm import tqdm
+
+    from tools.comparison.methods.rnd import _MLP
+
+    cal_dataset = LeRobotDataset(calibration_repo_id, root=calibration_root)
+    if cal_dataset.meta.episodes is None:
+        from lerobot.datasets.utils import load_episodes
+
+        cal_dataset.meta.episodes = load_episodes(cal_dataset.root)
+
+    n_eps = len(cal_dataset.meta.episodes)
+    print(f"[RND train] Collecting embeddings from {calibration_repo_id} ({n_eps} episodes) ...")
+
+    embeddings: list[np.ndarray] = []
+    for ep_idx in tqdm(range(n_eps), desc="[RND train] episodes"):
+        ep_from, ep_to = get_episode_bounds(cal_dataset, ep_idx)
+        loader = _make_loader(cal_dataset, list(range(ep_from, ep_to)), batch_size=16, num_workers=4)
+        for batch in loader:
+            obs = {
+                k: (v if isinstance(v, Tensor) else torch.as_tensor(v)).to(device, non_blocking=True)
+                for k, v in batch.items()
+                if k.startswith("observation.") or k == "observation_state"
+            }
+            with torch.no_grad():
+                policy.predict_action_chunk(obs)
+            batch_embs = extractor.last_batch
+            if batch_embs is not None:
+                embeddings.extend(batch_embs.copy())
+
+    if not embeddings:
+        print("[RND train] No embeddings collected — skipping training.")
+        return
+
+    emb_arr = np.array(embeddings, dtype=np.float32)
+    in_dim = emb_arr.shape[1]
+    print(f"[RND train] {len(emb_arr)} embeddings collected (dim={in_dim})")
+
+    target = _MLP(in_dim, hidden_dim, out_dim).to(device)
+    predictor = _MLP(in_dim, hidden_dim, out_dim).to(device)
+    for p in target.parameters():
+        p.requires_grad_(False)
+    target.eval()
+
+    optimizer = optim.Adam(predictor.parameters(), lr=lr)
+    data = torch.tensor(emb_arr, dtype=torch.float32)
+    loader_train = DataLoader(TensorDataset(data), batch_size=batch_size_train, shuffle=True)
+
+    for epoch in tqdm(range(n_epochs), desc="[RND train] epochs"):
+        predictor.train()
+        total = 0.0
+        for (x,) in loader_train:
+            x = x.to(device)
+            with torch.no_grad():
+                t = target(x)
+            loss = nn.functional.mse_loss(predictor(x), t)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            total += loss.item()
+        if (epoch + 1) % 10 == 0 or epoch == 0:
+            tqdm.write(f"  epoch {epoch + 1:3d}/{n_epochs}  loss={total / len(loader_train):.6f}")
+
+    predictor.eval()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "in_dim": in_dim,
+            "hidden_dim": hidden_dim,
+            "out_dim": out_dim,
+            "target": target.state_dict(),
+            "predictor": predictor.state_dict(),
+        },
+        output_path,
+    )
+    print(f"[RND train] Saved checkpoint → {output_path}")
+
+
+# ---------------------------------------------------------------------------
 # Calibration
 # ---------------------------------------------------------------------------
 
@@ -735,12 +838,30 @@ def main() -> None:
         "--methods",
         nargs="*",
         default=None,
-        choices=["pca_kmeans", "similarity", "all"],
+        choices=["stac", "rnd", "pca_kmeans", "similarity", "all"],
         help="Methods to run (default: all available).  Pass 'all' explicitly or omit to run every method.",
+    )
+    # RND (FIPER)
+    parser.add_argument(
+        "--rnd_checkpoint",
+        default=None,
+        help="Path to RND .pt checkpoint.  Defaults to outputs/rnd/<calibration_repo_id_name>.pt",
     )
     parser.add_argument("--output_dir", default=None, help="Defaults to <dataset_root>/comparison/")
     parser.add_argument("--num_episode", type=int, default=None)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    # STAC
+    parser.add_argument(
+        "--stac_execution_horizon",
+        type=int,
+        default=10,
+        help="Steps between re-predictions for STAC (default: 10).",
+    )
+    parser.add_argument(
+        "--stac_gamma",
+        default="median",
+        help="RBF gamma for STAC K(x,y)=exp(-γ||x-y||²): 'median' (default) or a float.",
+    )
     # PCA+KMeans (FAIL-Detect)
     parser.add_argument(
         "--pca_kmeans_emb_dim",
@@ -833,7 +954,7 @@ def _run_single(args) -> None:
     """Run the full compute+calibrate+evaluate pipeline for one (repo_id, calibration_repo_id) pair."""
     device = torch.device(args.device)
 
-    _all_methods = ["pca_kmeans", "similarity"]
+    _all_methods = ["stac", "rnd", "pca_kmeans", "similarity"]
     raw = args.methods
     if raw is None or raw == [] or raw == ["all"]:
         methods = list(_all_methods)
@@ -842,6 +963,20 @@ def _run_single(args) -> None:
     print(f"[INFO] Requested methods: {methods}")
 
     # Validate — remove methods whose dependencies are missing
+    # RND checkpoint path is resolved now; actual training (if needed) happens after
+    # the policy is loaded so we can reuse it for embedding collection.
+    rnd_ckpt: Path | None = None
+    if "rnd" in methods:
+        if not args.calibration_repo_id:
+            print("[WARN] 'rnd' requires --calibration_repo_id for training.  Removing it.")
+            methods.remove("rnd")
+        else:
+            rnd_ckpt = Path(
+                args.rnd_checkpoint
+                if args.rnd_checkpoint
+                else f"outputs/rnd/{Path(args.calibration_repo_id).name}.pt"
+            )
+
     if "pca_kmeans" in methods and not args.calibration_repo_id:
         print("[WARN] 'pca_kmeans' requires --calibration_repo_id for fitting.  Removing it.")
         methods.remove("pca_kmeans")
@@ -872,9 +1007,9 @@ def _run_single(args) -> None:
     # --- Policy ---
     policy = load_policy(model_path, device)
 
-    # --- Embedding extractor (shared by pca_kmeans, similarity) ---
+    # --- Embedding extractor (shared by rnd, pca_kmeans, similarity) ---
     extractor = None
-    needs_emb = any(m in methods for m in ("pca_kmeans", "similarity"))
+    needs_emb = any(m in methods for m in ("rnd", "pca_kmeans", "similarity"))
     if needs_emb:
         from tools.comparison.methods.embedding_extractor import EmbeddingExtractor
 
@@ -882,8 +1017,43 @@ def _run_single(args) -> None:
         extractor.attach(policy)
         print("[INFO] EmbeddingExtractor attached to policy.model.encoder")
 
+    # --- Train RND if checkpoint missing (or --recalibrate) ---
+    if "rnd" in methods and rnd_ckpt is not None:
+        if rnd_ckpt.exists() and not args.recalibrate:
+            print(f"[RND] Using cached checkpoint: {rnd_ckpt}")
+        else:
+            print(
+                f"[RND] {'Forced retraining' if args.recalibrate else 'No checkpoint found — training'}: {rnd_ckpt}"
+            )
+            _train_rnd_checkpoint(
+                calibration_repo_id=args.calibration_repo_id,
+                calibration_root=args.calibration_root or args.root,
+                policy=policy,
+                extractor=extractor,
+                device=device,
+                output_path=rnd_ckpt,
+            )
+        args.rnd_checkpoint = str(rnd_ckpt)
+
     # --- Build detectors (calibration runs first to fit PCAKMeans / thresholds) ---
     detectors: list[BaseDetector] = []
+
+    if "stac" in methods:
+        from tools.comparison.methods.stac import STACDetector
+
+        stac_gamma = args.stac_gamma if args.stac_gamma == "median" else float(args.stac_gamma)
+        detectors.append(
+            STACDetector(
+                execution_horizon=args.stac_execution_horizon,
+                gamma=stac_gamma,
+            )
+        )
+        print(f"[INFO] STAC: k={args.stac_execution_horizon}, gamma={args.stac_gamma}")
+
+    if "rnd" in methods:
+        from tools.comparison.methods.rnd import RNDDetector
+
+        detectors.append(RNDDetector(checkpoint_path=args.rnd_checkpoint, extractor=extractor, device=device))
 
     if "pca_kmeans" in methods:
         from tools.comparison.methods.pca_kmeans import PCAKMeansDetector
@@ -931,6 +1101,7 @@ def _run_single(args) -> None:
                     for d in detectors:
                         if isinstance(d, (PCAKMeansDetector, SimilarityDetector)):
                             d.fit(emb_arr)
+                    # RNDDetector is pre-trained; no fitting needed from emb_cache
                     print(f"[INFO] Re-fitted detectors from {emb_cache} ({len(emb_arr)} embeddings)")
                 else:
                     print(
