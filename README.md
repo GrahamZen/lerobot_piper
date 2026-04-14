@@ -560,3 +560,59 @@ python -m src.lerobot.async_inference.robot_client \
     --aggregate_fn_name=weighted_average \
     --debug_visualize_queue_size=True
 ```
+
+## 8. Safety Filter
+
+A QP-based safety filter (`lerobot.safety`) projects policy actions onto a safe set before they are sent to the motors. It runs on every step in logical-DOF space (14 values for `piper_dual`: 7 per arm), so it is transparent to the policy.
+
+### How it works
+
+1. **Pre-clip** — clamp the policy output to URDF joint limits so the QP always has a feasible starting point.
+2. **Forward kinematics** — compute the world-frame positions of critical links (`left/right_link4`, `left/right_link6`, `left/right_gripper_base`) using Pinocchio.
+3. **QP projection** — if any critical link violates a safety handle, solve a minimum-norm correction `δq` subject to linearised safety constraints and joint-limit bounds.
+4. **Post-clip** — clamp the result to joint limits to absorb OSQP numerical tolerance (~1e-3 rad).
+5. **Infeasible → stop** — if no safe action exists, raise `RuntimeError` and halt the robot immediately.
+
+### Box constraint modes
+
+The constraint is configured via a JSON file (see `tools/safety/constraint_config.json`):
+
+```json
+{
+  "x_min": -0.8,  "x_max": 0.8,
+  "y_min": -0.8,  "y_max": 0.8,
+  "z_min": -0.5,  "z_max": 1.2,
+  "mode": "inclusion",
+  "critical_links": [5,6,7,8,9,10,15,16,17,18,19,20]
+}
+```
+
+| `mode` | Meaning | Typical use |
+|--------|---------|-------------|
+| `"inclusion"` (default) | Links must stay **inside** the box | Limit the reachable workspace |
+| `"exclusion"` | Links must stay **outside** the box | Forbidden zone (e.g. avoid hitting a table) |
+
+For `exclusion`, the safety function is `h(pos) = -min(face distances)`: negative when the link is inside the forbidden box, positive when outside. The QP pushes the arm out through the nearest face.
+
+### Enabling on piper_dual
+
+Add these flags to any `lerobot-record` or `lerobot-eval` command:
+
+```bash
+uv run lerobot-record \
+  --robot.type=piper_dual \
+  --robot.safety_enabled=true \
+  --robot.safety_urdf_path=/path/to/assets/piper_dual_description/urdf/piper_dual_description.urdf \
+  --robot.safety_constraint_config=/path/to/tools/safety/constraint_config.json \
+  ...
+```
+
+`safety_enabled` defaults to `false`; omitting it leaves the filter completely bypassed with zero overhead.
+
+### Testing in simulation
+
+```bash
+uv run python tools/safety/test_safety.py
+```
+
+This runs a dangerous trajectory through the filter and visualises the corrected path in MuJoCo.

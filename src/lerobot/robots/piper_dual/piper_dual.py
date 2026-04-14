@@ -75,6 +75,9 @@ class PIPERDual(Robot):
         self._is_calibrated = False
         self.cameras = make_cameras_from_configs(config.cameras)
 
+        self._kin = None
+        self._safety_handles = None
+
     @property
     def camera_features(self) -> dict:
         cam_ft = {}
@@ -169,6 +172,32 @@ class PIPERDual(Robot):
     def observation_features(self) -> dict[str, type | tuple]:
         return {**self._motors_state_ft, **self._cameras_ft}
 
+    def _init_safety_filter(self) -> None:
+        from lerobot.safety import (
+            BoxConstraintConfig,
+            RobotKinematicsInfo,
+            load_constraint_config,
+            make_box_handles,
+        )
+
+        if not self.config.safety_urdf_path:
+            raise ValueError(
+                "safety_enabled=True requires safety_urdf_path to be set in PIPERDualConfig."
+            )
+
+        self._kin = RobotKinematicsInfo(self.config.safety_urdf_path)
+
+        if self.config.safety_constraint_config:
+            box = load_constraint_config(self.config.safety_constraint_config)
+        else:
+            box = BoxConstraintConfig()
+
+        self._safety_handles = make_box_handles(box)
+        logger.info(
+            f"[SafetyFilter] initialized. logical_dof={self._kin.logical_dof}, "
+            f"critical_links={self._kin.critical_link_names}"
+        )
+
     def configure(self, **kwargs):
         pass
 
@@ -222,6 +251,9 @@ class PIPERDual(Robot):
 
         print("All connected")
         self._is_connected = True
+
+        if self.config.safety_enabled:
+            self._init_safety_filter()
 
         if not self.config.read_only:
             self.calibrate()
@@ -295,6 +327,15 @@ class PIPERDual(Robot):
             # Standard named format
             left_target_joints = [action[f"left_{motor}.pos"] for motor in motor_order]
             right_target_joints = [action[f"right_{motor}.pos"] for motor in motor_order]
+
+        if self._kin is not None:
+            import numpy as np
+            from lerobot.safety import enforce_safe_action
+
+            q_logical = np.array(left_target_joints + right_target_joints, dtype=float)
+            q_safe = enforce_safe_action(q_logical, self._kin, self._safety_handles)
+            left_target_joints = q_safe[:7].tolist()
+            right_target_joints = q_safe[7:].tolist()
 
         if not self.config.read_only:
             self.left_bus.write(left_target_joints)

@@ -38,7 +38,7 @@ version = "0.4.4"
 description = "🤗 LeRobot: State-of-the-art Machine Learning for Real-World Robotics in Pytorch"
 dynamic = ["readme"]
 license = { text = "Apache-2.0" }
-requires-python = ">=3.10"
+requires-python = ">=3.11, <3.13"
 authors = [
     { name = "Rémi Cadène", email = "re.cadene@gmail.com" },
     { name = "Simon Alibert", email = "alibert.sim@gmail.com" },
@@ -69,7 +69,6 @@ dependencies = [
     "pyrealsense2",
     "matplotlib",
     "pre-commit",
-
     # Hugging Face dependencies
     "datasets>=4.0.0,<4.2.0",
     "diffusers>=0.27.2,<0.36.0",
@@ -100,6 +99,9 @@ dependencies = [
     "rich",
     "mujoco>=3.4.0",
     "tqdm>=4.67.2",
+    "pin>=3.4.0",
+    "qpsolvers>=4.11.0",
+    "osqp>=1.1.1",
 ]
 
 # Optional dependencies

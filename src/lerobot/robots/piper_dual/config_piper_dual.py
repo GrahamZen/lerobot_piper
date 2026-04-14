@@ -28,6 +28,11 @@ class PIPERDualConfig(RobotConfig):
     left_port: str = "can_left"
     right_port: str = "can_right"
     read_only: bool = False
+
+    # Safety filter — disabled by default, requires explicit opt-in.
+    safety_enabled: bool = False
+    safety_urdf_path: str | None = None         # path to piper_dual_description.urdf
+    safety_constraint_config: str | None = None  # path to constraint_config.json; None = use BoxConstraintConfig defaults
     cameras: dict[str, CameraConfig] = field(
         default_factory=lambda: {
             "wrist_left": OpenCVCameraConfig(
