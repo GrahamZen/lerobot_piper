@@ -34,9 +34,18 @@ class PersistentTIDEDetector:
         self.threshold_c = threshold_c
         self.c_t = 0.0
 
-    def update(self, raw_tide, current_action, prev_action):
-        act_diff = np.linalg.norm(current_action - prev_action)
-        current_regime = "1" if act_diff > 0.1 else "0"
+    def update(self, raw_tide, current_action, prev_action, prev_prev_action):
+        v_curr = current_action - prev_action
+        v_prev = prev_action - prev_prev_action
+        accel_norm = np.linalg.norm(v_curr - v_prev)
+        max_jump = np.max(np.abs(v_curr))
+
+        if max_jump > 0.5:
+            current_regime = "2"
+        elif accel_norm > 0.015:
+            current_regime = "1"
+        else:
+            current_regime = "0"
 
         calib = self.calibration_data.get(current_regime, {"mean": 0.0, "std": 1.0})
         mu = calib["mean"]
@@ -326,6 +335,7 @@ def visualize_dataset(
     prev_checkpoint_ts: int | None = None
     current_episode_idx = -1
     prev_act = None
+    prev_prev_act = None
 
     for global_step, ((episode_idx, frame_idx), item) in enumerate(zip(all_frames, loader, strict=True)):
         if episode_idx != current_episode_idx:
@@ -335,6 +345,7 @@ def visualize_dataset(
             prev_checkpoint_ts = None
             tide_detector.reset()
             prev_act = None
+            prev_prev_act = None
             print(f"Streaming Episode {episode_idx}/{episodes_to_visualize}...", end="\r")
 
         rr.set_time("step", sequence=frame_idx)
@@ -358,8 +369,9 @@ def visualize_dataset(
             curr_act = item["action"].numpy()
             if prev_act is None:
                 prev_act = curr_act
+                prev_prev_act = curr_act
 
-            is_failure, c_t, n_tide, regime = tide_detector.update(td_raw, curr_act, prev_act)
+            is_failure, c_t, n_tide, regime = tide_detector.update(td_raw, curr_act, prev_act, prev_prev_act)
             rr.log("metrics/detector/C_t", rr.Scalars(c_t))
             rr.log("metrics/detector/nTIDE", rr.Scalars(n_tide))
             rr.log("metrics/detector/threshold_C", rr.Scalars(tide_detector.threshold_c))
@@ -367,6 +379,7 @@ def visualize_dataset(
             if is_failure:
                 rr.log("metrics/detector/failed_markers", rr.Scalars(c_t))
 
+            prev_prev_act = prev_act
             prev_act = curr_act
 
             # Similarity — read directly

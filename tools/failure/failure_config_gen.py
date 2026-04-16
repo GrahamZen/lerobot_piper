@@ -130,12 +130,62 @@ def load_temporal_disagreement(metrics_path: Path, trim: int = 30) -> np.ndarray
     return np.array(scores, dtype=np.float64)
 
 
+def extract_action_history(dataset, global_step: int, use_hf_fast: bool):
+    try:
+        if use_hf_fast:
+            curr_ep = dataset.hf_dataset[global_step]["episode_index"]
+            curr_act = np.array(dataset.hf_dataset[global_step]["action"])
+            prev_act = curr_act
+            prev_prev_act = curr_act
+            if global_step > 0:
+                prev_ep = dataset.hf_dataset[global_step - 1]["episode_index"]
+                if prev_ep == curr_ep:
+                    prev_act = np.array(dataset.hf_dataset[global_step - 1]["action"])
+                    if global_step > 1:
+                        pp_ep = dataset.hf_dataset[global_step - 2]["episode_index"]
+                        if pp_ep == curr_ep:
+                            prev_prev_act = np.array(dataset.hf_dataset[global_step - 2]["action"])
+        else:
+            curr_item = dataset[global_step]
+            curr_ep = curr_item["episode_index"]
+            curr_act = curr_item["action"].numpy()
+            prev_act = curr_act
+            prev_prev_act = curr_act
+
+            if global_step > 0:
+                prev_item = dataset[global_step - 1]
+                if prev_item["episode_index"] == curr_ep:
+                    prev_act = prev_item["action"].numpy()
+                    if global_step > 1:
+                        pp_item = dataset[global_step - 2]
+                        if pp_item["episode_index"] == curr_ep:
+                            prev_prev_act = pp_item["action"].numpy()
+
+        return curr_act, prev_act, prev_prev_act
+    except Exception:
+        return np.zeros(1), np.zeros(1), np.zeros(1)
+
+
+def get_regime(curr_act, prev_act, prev_prev_act) -> str:
+    v_curr = curr_act - prev_act
+    v_prev = prev_act - prev_prev_act
+    accel_norm = np.linalg.norm(v_curr - v_prev)
+    max_jump = np.max(np.abs(v_curr))
+
+    if max_jump > 0.5:
+        return "2"
+    elif accel_norm > 0.015:
+        return "1"
+    else:
+        return "0"
+
+
 def compute_regime_calibration_data(dataset: LeRobotDataset, metrics_path: Path) -> dict:
     """Offline phase: Group actions into regimes and compute baseline mu, sigma for each regime."""
     from tqdm import tqdm
 
     failure_metrics = load_failure_metrics_jsonl(metrics_path.parent)
-    regime_stats: dict[str, list[float]] = {"0": [], "1": []}
+    regime_stats: dict[str, list[float]] = {"0": [], "1": [], "2": []}
 
     print(f"\n[Calibration] Extracting regime actions for {len(failure_metrics)} steps...")
 
@@ -154,37 +204,8 @@ def compute_regime_calibration_data(dataset: LeRobotDataset, metrics_path: Path)
         if td_raw is None:
             continue
 
-        try:
-            if use_hf_fast:
-                curr_ep = dataset.hf_dataset[global_step]["episode_index"]
-                curr_act = np.array(dataset.hf_dataset[global_step]["action"])
-                if global_step > 0:
-                    prev_ep = dataset.hf_dataset[global_step - 1]["episode_index"]
-                    if prev_ep == curr_ep:
-                        prev_act = np.array(dataset.hf_dataset[global_step - 1]["action"])
-                    else:
-                        prev_act = curr_act
-                else:
-                    prev_act = curr_act
-            else:
-                curr_item = dataset[global_step]
-                curr_ep = curr_item["episode_index"]
-                if global_step > 0:
-                    prev_item = dataset[global_step - 1]
-                    # Fallback to curr_item if crossing an episode boundary
-                    if prev_item["episode_index"] != curr_ep:
-                        prev_item = curr_item
-                else:
-                    prev_item = curr_item
-
-                curr_act = curr_item["action"].numpy()
-                prev_act = prev_item["action"].numpy()
-        except (IndexError, KeyError, TypeError, ValueError, RuntimeError):
-            continue
-
-        # Simple regime classifier based on action difference
-        act_diff = np.linalg.norm(curr_act - prev_act)
-        regime = "1" if act_diff > 0.1 else "0"
+        curr_act, prev_act, prev_prev_act = extract_action_history(dataset, global_step, use_hf_fast)
+        regime = get_regime(curr_act, prev_act, prev_prev_act)
 
         regime_stats[regime].append(float(td_raw))
 
@@ -234,34 +255,8 @@ def compute_cusum_maxima(
             global_step = int(global_step)
             td_raw = float(row.get("td_raw", row.get("temporal_disagreement", 0.0)))
 
-            try:
-                if use_hf_fast:
-                    curr_ep = dataset.hf_dataset[global_step]["episode_index"]
-                    curr_act = np.array(dataset.hf_dataset[global_step]["action"])
-                    if global_step > 0:
-                        prev_ep = dataset.hf_dataset[global_step - 1]["episode_index"]
-                        if prev_ep == curr_ep:
-                            prev_act = np.array(dataset.hf_dataset[global_step - 1]["action"])
-                        else:
-                            prev_act = curr_act
-                    else:
-                        prev_act = curr_act
-                else:
-                    curr_item = dataset[global_step]
-                    curr_ep = curr_item["episode_index"]
-                    if global_step > 0:
-                        prev_item = dataset[global_step - 1]
-                        if prev_item["episode_index"] != curr_ep:
-                            prev_item = curr_item
-                    else:
-                        prev_item = curr_item
-                    curr_act = curr_item["action"].numpy()
-                    prev_act = prev_item["action"].numpy()
-            except (IndexError, KeyError, TypeError, ValueError, RuntimeError):
-                curr_act, prev_act = np.zeros(1), np.zeros(1)
-
-            act_diff = np.linalg.norm(curr_act - prev_act)
-            regime = "1" if act_diff > 0.1 else "0"
+            curr_act, prev_act, prev_prev_act = extract_action_history(dataset, global_step, use_hf_fast)
+            regime = get_regime(curr_act, prev_act, prev_prev_act)
             calib = calibration_data.get(regime, {"mean": 0.0, "std": 1.0})
 
             n_tide = max(0.0, (td_raw - calib["mean"]) / calib["std"])
