@@ -163,15 +163,22 @@ class ACTPolicy(PreTrainedPolicy):
         return intended_action
 
     @torch.no_grad()
-    def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
-        """Predict a chunk of actions given environment observations."""
+    def predict_action_chunk(self, batch: dict[str, Tensor], sample_latent: bool = False) -> Tensor:
+        """Predict a chunk of actions given environment observations.
+
+        Args:
+            batch: Observation dict.
+            sample_latent: When True and the model uses a VAE (``use_vae=True``),
+                sample the latent from N(0, I) instead of using the zero vector.
+                This enables stochastic inference for entropy-based detectors.
+        """
         self.eval()
 
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
 
-        actions = self.model(batch)[0]
+        actions = self.model(batch, sample_latent=sample_latent)[0]
         return actions
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
@@ -416,7 +423,9 @@ class ACT(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, tuple[Tensor, Tensor] | tuple[None, None]]:
+    def forward(
+        self, batch: dict[str, Tensor], sample_latent: bool = False
+    ) -> tuple[Tensor, tuple[Tensor, Tensor] | tuple[None, None]]:
         """A forward pass through the Action Chunking Transformer (with optional VAE encoder).
 
         `batch` should have the following structure:
@@ -489,12 +498,18 @@ class ACT(nn.Module):
             # Sample the latent with the reparameterization trick.
             latent_sample = mu + log_sigma_x2.div(2).exp() * torch.randn_like(mu)
         else:
-            # When not using the VAE encoder, we set the latent to be all zeros.
             mu = log_sigma_x2 = None
+            # sample_latent=True: draw z ~ N(0, I) so each forward pass is unique.
+            # Default (False): use the zero vector — the original ACT inference behaviour.
             # TODO(rcadene, alexander-soare): remove call to `.to` to speedup forward ; precompute and use buffer
-            latent_sample = torch.zeros([batch_size, self.config.latent_dim], dtype=torch.float32).to(
-                batch[OBS_STATE].device
-            )
+            if sample_latent and self.config.use_vae:
+                latent_sample = torch.randn([batch_size, self.config.latent_dim], dtype=torch.float32).to(
+                    batch[OBS_STATE].device
+                )
+            else:
+                latent_sample = torch.zeros([batch_size, self.config.latent_dim], dtype=torch.float32).to(
+                    batch[OBS_STATE].device
+                )
 
         # Prepare transformer encoder inputs.
         encoder_in_tokens = [self.encoder_latent_input_proj(latent_sample)]

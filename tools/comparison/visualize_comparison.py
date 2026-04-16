@@ -55,8 +55,10 @@ from tools.comparison.methods.base import BaseDetector  # noqa: E402
 # Display name, colour (R,G,B) and optional threshold to draw
 _METHOD_STYLE: dict[str, dict] = {
     "td": {"label": "Ours (TD smoothed)", "color": (52, 152, 219)},  # blue
+    "rnd": {"label": "FIPER RND (OOD)", "color": (231, 76, 60)},  # red
     "similarity": {"label": "Similarity (Mahalanobis)", "color": (230, 126, 34)},  # orange
     "pca_kmeans": {"label": "PCA+KMeans", "color": (155, 89, 182)},  # purple
+    "logpzo": {"label": "logpZO (FAIL-Detect)", "color": (39, 174, 96)},  # green
 }
 
 _DEFAULT_COLOR = (150, 150, 150)

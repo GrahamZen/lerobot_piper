@@ -144,35 +144,125 @@ def compute_metrics(
 # ---------------------------------------------------------------------------
 
 
+def _episode_score(seq: list[float], tail_steps: int) -> float:
+    """Aggregate a per-step score sequence into a single episode score.
+
+    ``tail_steps=0``  → per-episode **max** (original behaviour).
+    ``tail_steps>0``  → mean of the **last K steps**.  Failures tend to end in
+    a persistently anomalous state (robot stuck/dropped object), so the tail
+    mean separates them from successes whose anomalies are transient
+    mid-trajectory peaks that return to normal by the end.
+    """
+    if not seq:
+        return 0.0
+    if tail_steps > 0:
+        return float(np.mean(seq[-tail_steps:]))
+    return float(max(seq))
+
+
 def _detect_max_threshold(
     train_scores: list[list[float]],
     test_scores: list[list[float]],
     test_labels: list[int],
     alpha: float,
     threshold: float | None = None,
+    tail_steps: int = 0,
 ) -> tuple[np.ndarray, np.ndarray, list[int]]:
-    """Scalar threshold detection using per-episode-max CP formula.
+    """Scalar threshold detection using per-episode CP formula.
 
-    threshold = CP quantile over per-episode **max** calibration scores:
+    When ``tail_steps=0`` (default): calibration score = per-episode **max**,
+    and failure is flagged at the first timestep where ``score > threshold``.
+
+    When ``tail_steps>0``: calibration score = mean of last ``tail_steps``
+    steps, and a test episode is flagged if its tail mean exceeds the
+    threshold.  Failure episodes typically end in a persistently anomalous
+    state, whereas successful episodes return to normal by the end — so the
+    tail mean gives much better separation than the max for RND / logpZO.
+
+    threshold = CP quantile over per-episode calibration scores:
         n = number of calibration episodes
         q_level = min(ceil((n+1)*(1-alpha)) / n, 1.0)
-        threshold = quantile(episode_max_scores, q_level)
+        threshold = quantile(episode_scores, q_level)
 
-    Using per-episode max (rather than all per-step values) gives a meaningful
-    threshold without smoothing: it covers the worst step in each successful
-    episode at the (1-alpha) conformal level.
+    Args:
+        threshold: If provided, skip computation and use this value directly.
+        tail_steps: Number of terminal steps to average for episode score.
+                    0 = use max (original behaviour).
+    """
+    if threshold is None:
+        cal_scores = [_episode_score(seq, tail_steps) for seq in train_scores if seq]
+        if cal_scores:
+            n = len(cal_scores)
+            q_level = min(float(np.ceil((n + 1) * (1.0 - alpha)) / n), 1.0)
+            threshold = float(np.quantile(cal_scores, q_level))
+        else:
+            threshold = 0.0
+
+    y_true: list[int] = []
+    y_pred: list[int] = []
+    first_steps: list[int] = []
+
+    for seq, label in zip(test_scores, test_labels, strict=False):
+        predicted = 0
+        if tail_steps > 0:
+            # Episode-level classification: tail mean vs threshold
+            if _episode_score(seq, tail_steps) > threshold:
+                predicted = 1
+                if label == 0:  # true positive
+                    first_steps.append(max(0, len(seq) - tail_steps))
+        else:
+            # Step-level detection: first step exceeding threshold
+            for t, score in enumerate(seq):
+                if score > threshold:
+                    predicted = 1
+                    if label == 0:  # true positive
+                        first_steps.append(t)
+                    break
+        y_true.append(1 - label)
+        y_pred.append(predicted)
+
+    return np.array(y_true), np.array(y_pred), first_steps
+
+
+# Methods whose detection threshold is calibrated on per-episode MIN scores
+# (i.e., where a *low* per-step score is anomalous and scores are NOT
+# already negated by the detector).  Currently unused — ActionEntropyDetector
+# negates in update() so the standard max-threshold path applies.
+_INVERTED_METHODS: frozenset[str] = frozenset()
+
+
+def _detect_min_threshold(
+    train_scores: list[list[float]],
+    test_scores: list[list[float]],
+    test_labels: list[int],
+    alpha: float,
+    threshold: float | None = None,
+    tail_steps: int = 0,
+) -> tuple[np.ndarray, np.ndarray, list[int]]:
+    """Scalar threshold detection for inverted-score methods.
+
+    Scores are stored **negated** so that failure → high (less-negative) score.
+    Calibration uses per-episode **min** (most negative = most normal) to
+    mirror how ``ActionEntropyDetector.calibration_score()`` works.
+
+    threshold = CP quantile over per-episode **min** calibration scores:
+        n = number of calibration episodes
+        q_level = min(ceil((n+1)*(1-alpha)) / n, 1.0)
+        threshold = quantile(episode_min_scores, q_level)
 
     Failure is flagged at the first timestep where ``score > threshold``.
 
     Args:
         threshold: If provided, skip computation and use this value directly.
+        tail_steps: Unused for min-threshold methods; kept for API parity.
     """
+    _ = tail_steps
     if threshold is None:
-        max_scores = [max(seq) for seq in train_scores if seq]
-        if max_scores:
-            n = len(max_scores)
+        min_scores = [min(seq) for seq in train_scores if seq]
+        if min_scores:
+            n = len(min_scores)
             q_level = min(float(np.ceil((n + 1) * (1.0 - alpha)) / n), 1.0)
-            threshold = float(np.quantile(max_scores, q_level))
+            threshold = float(np.quantile(min_scores, q_level))
         else:
             threshold = 0.0
 
@@ -209,6 +299,7 @@ def evaluate_method(
     debug: bool = False,
     cal_scores_by_episode: dict[int, list[float]] | None = None,
     saved_threshold: float | None = None,
+    tail_steps: int = 0,
 ) -> dict[str, float] | None:
     """Evaluate one method.
 
@@ -300,12 +391,18 @@ def evaluate_method(
 
     # Use the pre-computed threshold from {method}_threshold.json when available;
     # fall back to computing from the combined train+cal calibration pool otherwise.
-    y_true, y_pred, first_steps = _detect_max_threshold(
+    # When tail_steps>0, keep the saved max-based threshold — it is always ≥ any tail-mean
+    # of a success episode, so it correctly covers the tail-mean distribution of successes
+    # without being inflated by transient mid-trajectory anomaly peaks.
+    _detect_fn = _detect_min_threshold if method in _INVERTED_METHODS else _detect_max_threshold
+    _tail = 0 if method in _INVERTED_METHODS else tail_steps
+    y_true, y_pred, first_steps = _detect_fn(
         train_scores + cal_scores,
         test_scores,
         test_labels,
         alpha=alpha,
         threshold=saved_threshold,
+        tail_steps=_tail,
     )
 
     metrics = compute_metrics(y_true, y_pred)
@@ -432,6 +529,14 @@ def main() -> None:
         help="Where to write results.pkl and results.csv.  Defaults to <dataset_root>/comparison/.",
     )
     parser.add_argument(
+        "--tail_steps",
+        type=int,
+        default=0,
+        help="If >0, use mean of last N steps as episode score instead of max. "
+        "Useful for methods (RND, logpZO) where failures persist until episode end "
+        "but successes have only transient mid-trajectory anomalies (default: 0 = max).",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Print per-episode prediction table (episode index, true/pred label, "
@@ -538,6 +643,7 @@ def main() -> None:
             debug=args.debug,
             cal_scores_by_episode=cal_ep_scores,
             saved_threshold=saved_thresholds.get(method),
+            tail_steps=args.tail_steps,
         )
         if result is not None:
             records[method] = result
