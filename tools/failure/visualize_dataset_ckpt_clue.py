@@ -25,6 +25,38 @@ from lerobot.policies.failure_handling.config import FailureConfig
 # Helpers
 # ---------------------------------------------------------------------------
 
+
+class PersistentTIDEDetector:
+    def __init__(self, calibration_data, decay_lambda=0.95, k=1.0, threshold_c=5.0):
+        self.calibration_data = calibration_data
+        self.decay_lambda = decay_lambda
+        self.k = k
+        self.threshold_c = threshold_c
+        self.c_t = 0.0
+
+    def update(self, raw_tide, current_action, prev_action):
+        act_diff = np.linalg.norm(current_action - prev_action)
+        current_regime = "1" if act_diff > 0.1 else "0"
+
+        calib = self.calibration_data.get(current_regime, {"mean": 0.0, "std": 1.0})
+        mu = calib["mean"]
+        sigma = calib["std"]
+
+        # 1. Phase-aware Uncertainty Normalization (条件归一化)
+        n_tide = max(0.0, (raw_tide - mu) / sigma)
+
+        # 2. Temporal Persistence Statistic (CUSUM 累积)
+        self.c_t = max(0.0, self.decay_lambda * self.c_t + n_tide - self.k)
+
+        # 3. 最终判决
+        is_failure = self.c_t > self.threshold_c
+
+        return is_failure, self.c_t, n_tide, current_regime
+
+    def reset(self):
+        self.c_t = 0.0
+
+
 # All jsonl keys that may contain per-step similarity values.
 # List values → per-slot curves.  Scalar values → single curve (slot 0).
 _RECORDED_SIM_KEYS = [
@@ -178,12 +210,23 @@ def visualize_dataset(
     config = FailureConfig.from_json(failure_handling_json_path)
     print(f"[INFO] failure_threshold={config.detector.failure_threshold}")
 
+    with failure_handling_json_path.open("r", encoding="utf-8") as f:
+        raw_fh_config = json.load(f)
+    calibration_data = raw_fh_config.get("detector", {}).get("calibration_data")
+    if not calibration_data:
+        print("[WARN] calibration_data not found in failure_handling.json, using fallback stats.")
+        calibration_data = {"0": {"mean": 0.0, "std": 1.0}, "1": {"mean": 0.0, "std": 1.0}}
+
     # --- Recorded metrics ---
     recorded_metrics = load_failure_metrics_jsonl(dataset_root)
     print(f"[INFO] Loaded {len(recorded_metrics)} recorded metric rows.")
     if recorded_metrics:
         sample = next(iter(recorded_metrics.items()))
         print(f"[INFO] Sample row (key={sample[0]}): {list(sample[1].keys())}")
+
+    tide_detector = PersistentTIDEDetector(
+        calibration_data=calibration_data, decay_lambda=0.95, k=1.0, threshold_c=5.0
+    )
 
     # --- Rerun blueprint ---
     camera_keys = dataset.meta.camera_keys
@@ -204,6 +247,10 @@ def visualize_dataset(
                 ),
             ),
             rrb.TimeSeriesView(
+                name="TIDE Detector",
+                contents=["metrics/detector/**"],
+            ),
+            rrb.TimeSeriesView(
                 name="Similarity",
                 contents=["metrics/similarity/**"],
             ),
@@ -220,7 +267,7 @@ def visualize_dataset(
                 rrb.Spatial2DView(name="Checkpoint Frame", origin="checkpoint_view/stitched"),
                 column_shares=[1, 1],
             ),
-            row_shares=[1, 1, 1, 1.5],
+            row_shares=[1, 1, 1, 1, 1.5],
         ),
         collapse_panels=True,
     )
@@ -234,6 +281,16 @@ def visualize_dataset(
     )
     rr.log(
         "metrics/failure_threshold",
+        rr.SeriesLines(colors=[255, 165, 0]),
+        static=True,
+    )
+    rr.log(
+        "metrics/detector/failed_markers",
+        rr.SeriesPoints(colors=[255, 0, 0], markers="diamond", marker_sizes=5.0),
+        static=True,
+    )
+    rr.log(
+        "metrics/detector/threshold_C",
         rr.SeriesLines(colors=[255, 165, 0]),
         static=True,
     )
@@ -263,6 +320,7 @@ def visualize_dataset(
     rec_peaks: dict[int, float] = {}  # slot_idx -> current-episode max
     prev_checkpoint_ts: int | None = None
     current_episode_idx = -1
+    prev_act = None
 
     for global_step, ((episode_idx, frame_idx), item) in enumerate(zip(all_frames, loader, strict=True)):
         if episode_idx != current_episode_idx:
@@ -270,6 +328,8 @@ def visualize_dataset(
             current_episode_idx = episode_idx
             rec_peaks = {}
             prev_checkpoint_ts = None
+            tide_detector.reset()
+            prev_act = None
             print(f"Streaming Episode {episode_idx}/{episodes_to_visualize}...", end="\r")
 
         rr.set_time("step", sequence=frame_idx)
@@ -288,6 +348,21 @@ def visualize_dataset(
             rr.log("metrics/failure_threshold", rr.Scalars(config.detector.failure_threshold))
             if td_smoothed > config.detector.failure_threshold:
                 rr.log("metrics/td_smoothed/failed_markers", rr.Scalars(td_smoothed))
+
+            # Run TIDE Detector
+            curr_act = item["action"].numpy()
+            if prev_act is None:
+                prev_act = curr_act
+
+            is_failure, c_t, n_tide, regime = tide_detector.update(td_raw, curr_act, prev_act)
+            rr.log("metrics/detector/C_t", rr.Scalars(c_t))
+            rr.log("metrics/detector/nTIDE", rr.Scalars(n_tide))
+            rr.log("metrics/detector/threshold_C", rr.Scalars(tide_detector.threshold_c))
+            rr.log("metrics/detector/regime", rr.Scalars(float(regime)))
+            if is_failure:
+                rr.log("metrics/detector/failed_markers", rr.Scalars(c_t))
+
+            prev_act = curr_act
 
             # Similarity — read directly
             _log_recorded_similarity(row, rec_peaks)

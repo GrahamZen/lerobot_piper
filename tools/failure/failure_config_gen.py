@@ -130,6 +130,49 @@ def load_temporal_disagreement(metrics_path: Path, trim: int = 30) -> np.ndarray
     return np.array(scores, dtype=np.float64)
 
 
+def compute_regime_calibration_data(dataset: LeRobotDataset, metrics_path: Path) -> dict:
+    """Offline phase: Group actions into regimes and compute baseline mu, sigma for each regime."""
+    failure_metrics = load_failure_metrics_jsonl(metrics_path.parent)
+    regime_stats: dict[str, list[float]] = {"0": [], "1": []}
+
+    for row in failure_metrics.values():
+        global_step = row.get("global_step")
+        if global_step is None:
+            continue
+        global_step = int(global_step)
+
+        td_raw = row.get("td_raw", row.get("temporal_disagreement"))
+        if td_raw is None:
+            continue
+
+        try:
+            curr_item = dataset[global_step]
+            curr_ep = dataset.episode_data_index["episode_index"][global_step]
+            if global_step > 0 and dataset.episode_data_index["episode_index"][global_step - 1] == curr_ep:
+                prev_item = dataset[global_step - 1]
+            else:
+                prev_item = curr_item
+
+            curr_act = curr_item["action"].numpy()
+            prev_act = prev_item["action"].numpy()
+        except (IndexError, KeyError, TypeError, ValueError, RuntimeError):
+            continue
+
+        # Simple regime classifier based on action difference
+        act_diff = np.linalg.norm(curr_act - prev_act)
+        regime = "1" if act_diff > 0.1 else "0"
+
+        regime_stats[regime].append(float(td_raw))
+
+    calibration_data = {}
+    for regime, tides in regime_stats.items():
+        if not tides:
+            calibration_data[regime] = {"mean": 0.0, "std": 1.0}
+        else:
+            calibration_data[regime] = {"mean": float(np.mean(tides)), "std": float(np.std(tides)) + 1e-6}
+    return calibration_data
+
+
 # ---------------------------------------------------------------------------
 # Encoder-out feature computation
 # ---------------------------------------------------------------------------
@@ -558,6 +601,15 @@ def main() -> None:
         return
     pretrained_path = Path(pretrained_path_str).expanduser()
 
+    # ---- Compute Regime Calibration ----
+    eval_dataset = LeRobotDataset(args.repo_id, root=repo_dir)
+    if eval_dataset.meta.episodes is None:
+        from lerobot.datasets.utils import load_episodes
+
+        eval_dataset.meta.episodes = load_episodes(eval_dataset.root)
+    calibration_data = compute_regime_calibration_data(eval_dataset, metrics_path)
+    print(f"\n[Calibration] Computed regime calibration data: {calibration_data}")
+
     # ---- Write failure_handling.json (always overwrite completely) ----
     failure_handling_path = pretrained_path / "failure_handling.json"
     config = {
@@ -569,6 +621,7 @@ def main() -> None:
             "td_smoothing_sigma": 4.0,
             "td_window_size": 31,
             "td_rho": 1.0,
+            "calibration_data": calibration_data,
         },
         "strategy": {
             "name": "checkpoint_flat",
