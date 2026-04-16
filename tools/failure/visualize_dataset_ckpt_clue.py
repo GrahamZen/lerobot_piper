@@ -37,15 +37,21 @@ class PersistentTIDEDetector:
     def update(self, raw_tide, current_action, prev_action, prev_prev_action):
         v_curr = current_action - prev_action
         v_prev = prev_action - prev_prev_action
+
+        speed = np.linalg.norm(v_curr)
         accel_norm = np.linalg.norm(v_curr - v_prev)
         max_jump = np.max(np.abs(v_curr))
 
-        if max_jump > 0.5:
+        if speed < 1e-3 and np.linalg.norm(v_prev) < 1e-3:
+            current_regime = "0"
+        elif np.linalg.norm(v_prev) < 1e-3 and speed >= 1e-3:
+            current_regime = "start"
+        elif max_jump > 0.5:
             current_regime = "2"
         elif accel_norm > 0.015:
             current_regime = "1"
         else:
-            current_regime = "0"
+            current_regime = "move"
 
         calib = self.calibration_data.get(current_regime, {"mean": 0.0, "std": 1.0})
         mu = calib["mean"]
@@ -375,7 +381,11 @@ def visualize_dataset(
             rr.log("metrics/detector/C_t", rr.Scalars(c_t))
             rr.log("metrics/detector/nTIDE", rr.Scalars(n_tide))
             rr.log("metrics/detector/threshold_C", rr.Scalars(tide_detector.threshold_c))
-            rr.log("metrics/detector/regime", rr.Scalars(float(regime)))
+
+            # map regime string to float for display
+            regime_val = {"0": 0.0, "start": 0.5, "move": 1.0, "1": 1.5, "2": 2.0}.get(regime, 0.0)
+            rr.log("metrics/detector/regime", rr.Scalars(regime_val))
+
             if is_failure:
                 rr.log("metrics/detector/failed_markers", rr.Scalars(c_t))
 

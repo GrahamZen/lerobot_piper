@@ -169,15 +169,21 @@ def extract_action_history(dataset, global_step: int, use_hf_fast: bool):
 def get_regime(curr_act, prev_act, prev_prev_act) -> str:
     v_curr = curr_act - prev_act
     v_prev = prev_act - prev_prev_act
+
+    speed = np.linalg.norm(v_curr)
     accel_norm = np.linalg.norm(v_curr - v_prev)
     max_jump = np.max(np.abs(v_curr))
 
-    if max_jump > 0.5:
+    if speed < 1e-3 and np.linalg.norm(v_prev) < 1e-3:
+        return "0"  # rest
+    elif np.linalg.norm(v_prev) < 1e-3 and speed >= 1e-3:
+        return "start"  # rest -> motion onset
+    elif max_jump > 0.5:
         return "2"
     elif accel_norm > 0.015:
         return "1"
     else:
-        return "0"
+        return "move"
 
 
 def compute_regime_calibration_data(dataset: LeRobotDataset, metrics_path: Path) -> dict:
@@ -185,7 +191,7 @@ def compute_regime_calibration_data(dataset: LeRobotDataset, metrics_path: Path)
     from tqdm import tqdm
 
     failure_metrics = load_failure_metrics_jsonl(metrics_path.parent)
-    regime_stats: dict[str, list[float]] = {"0": [], "1": [], "2": []}
+    regime_stats: dict[str, list[float]] = {"0": [], "1": [], "2": [], "start": [], "move": []}
 
     print(f"\n[Calibration] Extracting regime actions for {len(failure_metrics)} steps...")
 
