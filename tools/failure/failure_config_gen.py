@@ -132,10 +132,19 @@ def load_temporal_disagreement(metrics_path: Path, trim: int = 30) -> np.ndarray
 
 def compute_regime_calibration_data(dataset: LeRobotDataset, metrics_path: Path) -> dict:
     """Offline phase: Group actions into regimes and compute baseline mu, sigma for each regime."""
+    from tqdm import tqdm
+
     failure_metrics = load_failure_metrics_jsonl(metrics_path.parent)
     regime_stats: dict[str, list[float]] = {"0": [], "1": []}
 
-    for row in failure_metrics.values():
+    print(f"\n[Calibration] Extracting regime actions for {len(failure_metrics)} steps...")
+
+    # Try to access underlying tabular dataset directly to avoid extremely slow video decoding
+    use_hf_fast = hasattr(dataset, "hf_dataset")
+    if use_hf_fast:
+        print("  -> Using fast tabular dataset access (bypassing video decoding)")
+
+    for row in tqdm(failure_metrics.values(), desc="  Regime Calib", leave=False):
         global_step = row.get("global_step")
         if global_step is None:
             continue
@@ -146,15 +155,30 @@ def compute_regime_calibration_data(dataset: LeRobotDataset, metrics_path: Path)
             continue
 
         try:
-            curr_item = dataset[global_step]
-            curr_ep = dataset.episode_data_index["episode_index"][global_step]
-            if global_step > 0 and dataset.episode_data_index["episode_index"][global_step - 1] == curr_ep:
-                prev_item = dataset[global_step - 1]
+            if use_hf_fast:
+                curr_ep = dataset.hf_dataset[global_step]["episode_index"]
+                curr_act = np.array(dataset.hf_dataset[global_step]["action"])
+                if global_step > 0:
+                    prev_ep = dataset.hf_dataset[global_step - 1]["episode_index"]
+                    if prev_ep == curr_ep:
+                        prev_act = np.array(dataset.hf_dataset[global_step - 1]["action"])
+                    else:
+                        prev_act = curr_act
+                else:
+                    prev_act = curr_act
             else:
-                prev_item = curr_item
+                curr_item = dataset[global_step]
+                curr_ep = curr_item["episode_index"]
+                if global_step > 0:
+                    prev_item = dataset[global_step - 1]
+                    # Fallback to curr_item if crossing an episode boundary
+                    if prev_item["episode_index"] != curr_ep:
+                        prev_item = curr_item
+                else:
+                    prev_item = curr_item
 
-            curr_act = curr_item["action"].numpy()
-            prev_act = prev_item["action"].numpy()
+                curr_act = curr_item["action"].numpy()
+                prev_act = prev_item["action"].numpy()
         except (IndexError, KeyError, TypeError, ValueError, RuntimeError):
             continue
 
@@ -171,6 +195,84 @@ def compute_regime_calibration_data(dataset: LeRobotDataset, metrics_path: Path)
         else:
             calibration_data[regime] = {"mean": float(np.mean(tides)), "std": float(np.std(tides)) + 1e-6}
     return calibration_data
+
+
+def compute_cusum_maxima(
+    dataset: LeRobotDataset, metrics_path: Path, calibration_data: dict, trim: int = 30
+) -> np.ndarray:
+    """Simulate CUSUM tracking and return the maximum C_t for each episode."""
+    from tqdm import tqdm
+
+    failure_metrics = load_failure_metrics_jsonl(metrics_path.parent)
+    grouped: dict[int, list[dict]] = {}
+    for row in failure_metrics.values():
+        ep = int(row.get("episode", 0))
+        grouped.setdefault(ep, []).append(row)
+
+    use_hf_fast = hasattr(dataset, "hf_dataset")
+    maxima = []
+
+    decay_lambda = 0.95
+    k = 1.0
+
+    print(f"\n[Calibration] Simulating CUSUM for {len(grouped)} episodes to find maxima...")
+
+    for ep in tqdm(sorted(grouped), desc="  CUSUM Maxima", leave=False):
+        ep_rows = grouped[ep]
+        if trim > 0:
+            if len(ep_rows) <= 2 * trim:
+                continue
+            ep_rows = ep_rows[trim:-trim]
+
+        c_t = 0.0
+        m_i = 0.0
+
+        for row in ep_rows:
+            global_step = row.get("global_step")
+            if global_step is None:
+                continue
+            global_step = int(global_step)
+            td_raw = float(row.get("td_raw", row.get("temporal_disagreement", 0.0)))
+
+            try:
+                if use_hf_fast:
+                    curr_ep = dataset.hf_dataset[global_step]["episode_index"]
+                    curr_act = np.array(dataset.hf_dataset[global_step]["action"])
+                    if global_step > 0:
+                        prev_ep = dataset.hf_dataset[global_step - 1]["episode_index"]
+                        if prev_ep == curr_ep:
+                            prev_act = np.array(dataset.hf_dataset[global_step - 1]["action"])
+                        else:
+                            prev_act = curr_act
+                    else:
+                        prev_act = curr_act
+                else:
+                    curr_item = dataset[global_step]
+                    curr_ep = curr_item["episode_index"]
+                    if global_step > 0:
+                        prev_item = dataset[global_step - 1]
+                        if prev_item["episode_index"] != curr_ep:
+                            prev_item = curr_item
+                    else:
+                        prev_item = curr_item
+                    curr_act = curr_item["action"].numpy()
+                    prev_act = prev_item["action"].numpy()
+            except (IndexError, KeyError, TypeError, ValueError, RuntimeError):
+                curr_act, prev_act = np.zeros(1), np.zeros(1)
+
+            act_diff = np.linalg.norm(curr_act - prev_act)
+            regime = "1" if act_diff > 0.1 else "0"
+            calib = calibration_data.get(regime, {"mean": 0.0, "std": 1.0})
+
+            n_tide = max(0.0, (td_raw - calib["mean"]) / calib["std"])
+            c_t = max(0.0, decay_lambda * c_t + n_tide - k)
+            m_i = max(m_i, c_t)
+
+        maxima.append(m_i)
+
+    if not maxima:
+        raise ValueError(f"No valid CUSUM maxima computed in {metrics_path}")
+    return np.array(maxima, dtype=np.float64)
 
 
 # ---------------------------------------------------------------------------
@@ -577,16 +679,32 @@ def main() -> None:
     metrics_path = repo_dir / "failure_metrics.jsonl"
     record_config_path = repo_dir / "meta" / "record_config.json"
 
-    # ---- CP threshold ----
-    calibration_scores = load_temporal_disagreement(metrics_path, trim=args.trim_episode_frames)
+    # ---- Compute Regime Calibration ----
+    eval_dataset = LeRobotDataset(args.repo_id, root=repo_dir)
+    if eval_dataset.meta.episodes is None:
+        from lerobot.datasets.utils import load_episodes
+
+        eval_dataset.meta.episodes = load_episodes(eval_dataset.root)
+    calibration_data = compute_regime_calibration_data(eval_dataset, metrics_path)
+    print(f"\n[Calibration] Computed regime calibration data: {calibration_data}")
+
+    # ---- CP threshold (original td_raw) ----
+    td_raw_scores = load_temporal_disagreement(metrics_path, trim=args.trim_episode_frames)
+    td_threshold, td_q_level, td_n = compute_cp_threshold(td_raw_scores, args.alpha)
+
+    # ---- CP threshold (CUSUM maxima) ----
+    calibration_scores = compute_cusum_maxima(
+        eval_dataset, metrics_path, calibration_data, trim=args.trim_episode_frames
+    )
     cp_threshold, q_level, n = compute_cp_threshold(calibration_scores, args.alpha)
 
     print(f"\nrepo_id: {args.repo_id}")
-    print(f"samples (n): {n}")
+    print(f"samples (n_episodes): {n} / (n_steps): {td_n}")
     print(f"alpha: {args.alpha}")
     print(f"trim_episode_frames: {args.trim_episode_frames}")
-    print(f"q_level: {q_level}")
-    print(f"cp_threshold: {cp_threshold}")
+    print(f"q_level (C_t): {q_level} / (td): {td_q_level}")
+    print(f"cusum_threshold: {cp_threshold}")
+    print(f"td_threshold: {td_threshold}")
 
     # ---- Resolve pretrained_path ----
     if not record_config_path.exists():
@@ -601,15 +719,6 @@ def main() -> None:
         return
     pretrained_path = Path(pretrained_path_str).expanduser()
 
-    # ---- Compute Regime Calibration ----
-    eval_dataset = LeRobotDataset(args.repo_id, root=repo_dir)
-    if eval_dataset.meta.episodes is None:
-        from lerobot.datasets.utils import load_episodes
-
-        eval_dataset.meta.episodes = load_episodes(eval_dataset.root)
-    calibration_data = compute_regime_calibration_data(eval_dataset, metrics_path)
-    print(f"\n[Calibration] Computed regime calibration data: {calibration_data}")
-
     # ---- Write failure_handling.json (always overwrite completely) ----
     failure_handling_path = pretrained_path / "failure_handling.json"
     config = {
@@ -617,7 +726,8 @@ def main() -> None:
         "enable_logging": True,
         "flush_metrics_every_step": False,
         "detector": {
-            "failure_threshold": float(cp_threshold),
+            "failure_threshold": float(td_threshold),
+            "cusum_threshold": float(cp_threshold),
             "td_smoothing_sigma": 4.0,
             "td_window_size": 31,
             "td_rho": 1.0,

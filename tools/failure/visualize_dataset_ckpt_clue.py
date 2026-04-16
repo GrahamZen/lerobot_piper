@@ -212,7 +212,9 @@ def visualize_dataset(
 
     with failure_handling_json_path.open("r", encoding="utf-8") as f:
         raw_fh_config = json.load(f)
-    calibration_data = raw_fh_config.get("detector", {}).get("calibration_data")
+    detector_cfg = raw_fh_config.get("detector", {})
+    calibration_data = detector_cfg.get("calibration_data")
+    cusum_threshold = detector_cfg.get("cusum_threshold", 5.0)
     if not calibration_data:
         print("[WARN] calibration_data not found in failure_handling.json, using fallback stats.")
         calibration_data = {"0": {"mean": 0.0, "std": 1.0}, "1": {"mean": 0.0, "std": 1.0}}
@@ -225,7 +227,10 @@ def visualize_dataset(
         print(f"[INFO] Sample row (key={sample[0]}): {list(sample[1].keys())}")
 
     tide_detector = PersistentTIDEDetector(
-        calibration_data=calibration_data, decay_lambda=0.95, k=1.0, threshold_c=5.0
+        calibration_data=calibration_data,
+        decay_lambda=0.95,
+        k=1.0,
+        threshold_c=cusum_threshold,
     )
 
     # --- Rerun blueprint ---
